@@ -1,0 +1,3067 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>留灯</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #120d13; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; touch-action: none; border-radius: 18px; box-shadow: 0 0 0 1px #3a2c34; }
+  @media (max-width: 520px) { canvas { border-radius: 0; box-shadow: none; } }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+// 极简 CommonJS：模拟微信小游戏的 require
+var __m = {}, __c = {};
+function __def(name, fn) { __m[name] = fn; }
+function __resolve(from, p) {
+  var parts = (from.indexOf('/') >= 0 ? from.slice(0, from.lastIndexOf('/')) : '').split('/').filter(Boolean);
+  p.split('/').forEach(function (s) { if (s === '..') parts.pop(); else if (s && s !== '.') parts.push(s); });
+  var k = parts.join('/');
+  return __m[k] ? k : k + '.js';
+}
+function __require(from) {
+  return function (p) {
+    var k = __resolve(from, p);
+    if (__c[k]) return __c[k].exports;
+    if (!__m[k]) throw new Error('找不到模块 ' + k);
+    var module = { exports: {} };
+    __c[k] = module;
+    __m[k](module, module.exports, __require(k));
+    return module.exports;
+  };
+}
+__def("game.js", function (module, exports, require) {
+// 微信小游戏入口。浏览器预览也从这里进（见 tools/build-preview.js）。
+require('./js/main.js');
+
+});
+__def("js/config.js", function (module, exports, require) {
+// 《留灯》原型 · 所有可以调的数都在这里。
+// 时间单位：游戏里的「分钟」（一天 = 1440 分钟）。需求值 0~100，100 = 完全满足。
+
+const config = {
+  version: '留灯 · 原型 0.1',
+  saveKey: 'liudeng_save_v1',
+  petName: '灯芯',
+
+  // —— 时间 ——
+  time: {
+    // 真实 1 分钟 = 游戏里几分钟。1 = 跟真实时间一样；10 = 真实 2.4 小时过完游戏一天。
+    gamePerRealMin: 10,
+    startDay: 1,
+    startHour: 19, // 第一次打开时是几点（傍晚开局，马上就到小C的夜班）
+    offlineMaxMin: 36 * 60, // 关掉再打开，最多补算多久（游戏分钟）
+    awaySummaryMin: 30, // 离开超过这么久，回来弹「你不在的时候」
+    fastForwardMin: 180, // 调试按钮「快进」一次快进多久
+  },
+
+  // —— 需求：每小时掉多少（醒着时）。睡着时乘 sleepMul，生病时乘 sickMul ——
+  needs: {
+    start: { food: 70, rest: 55, love: 65, clean: 75 },
+    decayPerHour: { food: 6.5, rest: 4.5, love: 5.5, clean: 4 },
+    sleepMul: { food: 0.5, love: 0.4, clean: 0.4 },
+    sickMul: 1.35,
+    lowAt: 30, // 低于这个，需求条变红、闪
+  },
+
+  // —— 照顾动作 ——
+  acts: {
+    feed: { gain: 32, sickGain: 22, cleanCost: 7, fullAt: 88 }, // 吃完会弄脏一点
+    pat: { gain: 22, asleepGain: 12, fullAt: 96, rubDist: 260, sulkRubMul: 2 }, // rubDist：手指在它身上划多长算摸完一次（点）
+    tuck: { sleepyAt: 75, maxSleepMin: 6 * 60 }, // 困到 75 以下才肯盖被子睡；最多睡多久
+    clean: { gain: 50, fullAt: 88, rubDist: 320 },
+    companyLove: 3, // 有人来做任何事，它都开心一点
+  },
+
+  // —— 睡觉 ——
+  sleep: {
+    restorePerHour: 20, // 盖着被子睡，每小时回多少
+    floorMul: 0.55, // 没盖被子睡地板，只回这么多
+    collapseAt: 8, // 困到这个值就直接倒在地板上睡
+    wakeHungryAt: 8, // 饿到这个值会被饿醒
+    floorColdPerHour: 0.08, // 睡地板每小时着凉（生病）的机会
+  },
+
+  // —— 你的精力：一个人照顾不过来 ——
+  energy: {
+    max: 3, // 最多攒几点
+    regenMin: 180, // 多久回一点（游戏分钟）
+    start: 3,
+  },
+
+  // —— 后果 ——
+  sulk: { below: 25, recoverAt: 40 }, // 任何一项低于 25 闹脾气（背过身、摸要摸两倍久），都回到 40 以上才好
+  sick: {
+    neglectAt: 5, // 某项低到这个值开始算「被冷落」
+    neglectMin: 360, // 被冷落累计这么久就生病
+    recoverAllAbove: 50, // 不请医生：所有需求都在 50 以上……
+    recoverMin: 10 * 60, // ……连续这么久才自己好
+  },
+  corner: { loveBelow: 22, backAt: 50 }, // 心情太低，它会跑去最近照顾它的朋友角落睡；回到 50 才回来
+  miss: { afterMin: 20 * 60 }, // 谁超过这么久没来，它就望着谁的角落
+
+  // —— 两个假朋友（第一版没有服务器，朋友是按作息自己来的假人）——
+  // shifts：每天几点来、做什么。skip：每次缺席的机会。tripPerDay：出远门（连着几天不来）的机会
+  friends: [
+    {
+      id: 'c', name: '小C', habit: '夜猫子', tag: '#7f9a5a',
+      shifts: [{ at: '23:10', acts: ['tuck', 'pat'] }, { at: '13:20', acts: ['pat'] }],
+      skip: 0.3, tripPerDay: 0.0, tripDays: [1, 2],
+      reasons: ['在加班', '赶稿到很晚', '和同事聚餐', '睡着了'],
+      heartChance: 0.45, knockChance: 0.35, furniture: 'record',
+    },
+    {
+      id: 's', name: '阿树', habit: '早起', tag: '#5b7fb0',
+      shifts: [{ at: '07:40', acts: ['feed', 'clean'] }, { at: '18:30', acts: ['feed'] }],
+      skip: 0.22, tripPerDay: 0.12, tripDays: [1, 2],
+      reasons: ['睡过头了', '临时加班', '赶地铁没空'],
+      heartChance: 0.4, knockChance: 0.4, furniture: 'plant',
+    },
+  ],
+  friendVisitMin: 25, // 朋友来了在角落站多久（看得到她）
+  heartSkipMul: 0.5, // 你今天给她留了爱心，她缺席的机会减半
+  heartEnergy: 1, // 收下朋友留的爱心，回几点精力
+
+  // 朋友缺席后，「替她」的窗口
+  cover: { windowMin: 240 },
+
+  // —— 激励视频（假的）——
+  rewardedAdUnitId: '', // 空着 = 放「广告占位」
+  fakeAdSec: 1.5,
+
+  // —— 家具：每人一个角落放一件 ——
+  furniture: {
+    mine: ['beanbag', 'shelf', 'tank', 'yarn'], // 免费可选
+    limited: 'tent', // 限定：看广告解锁
+  },
+
+  // —— 分享卡（假的，只展示） ——
+  share: {
+    realShare: false, // true 时在微信里真的调起分享
+    lines: {
+      food: '它饿了，快回来喂它',
+      rest: '它困了，快回来给它盖被子',
+      love: '它想你了，快回来摸摸它',
+      clean: '它脏兮兮的，快回来帮它洗洗',
+      sick: '它生病了，快回来看看它',
+      ok: '灯还亮着，回来坐坐',
+    },
+  },
+};
+
+module.exports = config;
+
+});
+__def("js/main.js", function (module, exports, require) {
+// 《留灯》原型主程序：开场 → 小屋。所有画面画在一张 canvas 上（微信小游戏没有 HTML 按钮）。
+//
+// 小屋里：
+//   上面   钟 + 你的精力（灯火）+ 调试「快进」
+//   中间   房间：小C 的角落（左）、你的角落（窗下）、阿树的角落（右），猫「灯芯」在地毯上
+//   下面   四条需求（饱 / 困 / 心 / 净）→ 四个照顾按钮（喂 / 摸 / 盖被 / 洗）→ 最新一条痕迹 + 分享
+// 弹层（G.over）：away 你不在的时候 · log 全部痕迹 · share 分享卡 · friend 朋友 · furn 摆家具 · ad 广告占位
+const platform = require('./platform.js');
+const config = require('./config.js');
+const sim = require('./sim.js');
+const pix = require('./pix.js');
+const room = require('./room.js');
+const sfx = require('./sfx.js');
+const { PAL } = pix;
+
+const DESIGN_W = 375;
+const FONT = '"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif';
+const P = platform.setup(onTouch);
+const scale = P.width / DESIGN_W;
+const L = { W: DESIGN_W, H: P.height / scale };
+const ctx = P.ctx;
+
+// —— 版面 ——
+const TOP = 56;
+const BOTTOM_UI = 238;
+const R = room.layout(L.W, TOP, L.H - BOTTOM_UI);
+const UI = (() => {
+  const y0 = R.bottom;
+  const needsY = y0 + 12;
+  const btnY = needsY + 76;
+  const traceY = btnY + 66;
+  return {
+    needsY,
+    btnY,
+    traceY,
+    btns: ['feed', 'pat', 'tuck', 'clean'].map((k, i) => ({ id: 'act_' + k, act: k, x: 50 + i * 91.7, y: btnY, r: 33 })),
+  };
+})();
+
+const NEED_ICON = { food: 'food', rest: 'rest', love: 'love', clean: 'clean' };
+const ACT_ICON = { feed: 'food', pat: 'hand', tuck: 'blanket', clean: 'sponge' };
+const ACT_LABEL = { feed: '喂', pat: '摸头', tuck: '盖被', clean: '洗' };
+const REASON = { tired: '没精力了', asleep: '嘘…它在睡', full: '它现在不需要', notSleepy: '它还不困' };
+
+// —— 状态 ——
+let S = null; // 规则层存档（sim.js）
+const G = {
+  mode: 'title',
+  t: 0,
+  over: null, // 当前弹层
+  buttons: [],
+  pressed: null,
+  tool: null, // 'clean' = 拿着海绵
+  hint: 0, // 「在它身上来回划」提示还剩几秒
+  rub: null, // { id, x, y, dist, moved, kind }
+  parts: [],
+  floats: [],
+  toast: null,
+  big: null, // 大字（替朋友、治好……）
+  flash: 0,
+  lampBoost: 0,
+  doorShake: 0,
+  bars: null, // 需求条显示值（平滑追上真实值）
+  pet: { x: R.pet.x, y: R.pet.y, face: 1, hop: 0, happy: 0, eat: 0, blink: 0, nextBlink: 2, wander: 0, wx: 0, lookAt: null, lookT: 0, react: 0 },
+  blanketDrop: 0,
+  pour: 0,
+  visitors: {}, // 正在屋里的朋友：{ c: 剩几秒 }
+  saveT: 0,
+  ffCount: 0,
+  firstRoom: true,
+};
+
+function now() {
+  return platform.now();
+}
+
+// —— 存档 ——
+function loadOrNew() {
+  const saved = platform.load(config.saveKey);
+  if (saved && saved.v === 1) {
+    S = saved;
+    S.events = [];
+    const lastReal = S.lastReal || now();
+    const gone = Math.max(0, ((now() - lastReal) / 60000) * config.time.gamePerRealMin);
+    catchUp(Math.min(gone, config.time.offlineMaxMin), '你不在的时候');
+  } else {
+    S = sim.newState(Math.floor(Math.random() * 1e9));
+    S.lastReal = now();
+    S.firstOpen = true;
+  }
+  G.bars = Object.assign({}, S.needs);
+}
+
+function save() {
+  S.lastReal = now();
+  platform.save(config.saveKey, S);
+}
+
+// 补算一段时间（关掉再打开 / 快进），之后弹「你不在的时候」
+function catchUp(min, title) {
+  if (min < 1) return;
+  const from = S.t;
+  const missedMe = S.missing.me;
+  const wasSick = S.sick;
+  sim.advance(S, min);
+  S.events = [];
+  const lines = S.log.filter((e) => e.t > from);
+  if (min >= config.time.awaySummaryMin || lines.length) {
+    G.over = { type: 'away', title, min: Math.round(min), lines, t: 0, reunion: !!S.missing.me || missedMe, sickNow: S.sick && !wasSick };
+  }
+}
+
+// —— 输入 ——
+function hit(b, x, y) {
+  if (b.r) return Math.hypot(x - b.x, y - b.y) <= b.r + 6;
+  return x >= b.x - 4 && x <= b.x + b.w + 4 && y >= b.y - 4 && y <= b.y + b.h + 4;
+}
+
+function findButton(x, y) {
+  for (let i = G.buttons.length - 1; i >= 0; i--) if (hit(G.buttons[i], x, y)) return G.buttons[i];
+  return null;
+}
+
+function petHit(x, y) {
+  const p = G.pet;
+  return Math.abs(x - p.x) < 52 && y > p.y - 78 && y < p.y + 10;
+}
+
+function onTouch(type, id, sx, sy) {
+  const x = sx / scale;
+  const y = sy / scale;
+  if (type === 'down') {
+    const b = findButton(x, y);
+    if (b) {
+      G.pressed = { id: b.id, tid: id };
+      sfx.press();
+      return;
+    }
+    if (G.mode === 'room' && !G.over && petHit(x, y)) {
+      G.rub = { id, x, y, x0: x, y0: y, dist: 0, moved: 0, kind: G.tool === 'clean' ? 'clean' : 'pat', lastSnd: 0, step: 0 };
+      return;
+    }
+    if (G.over && G.over.tapClose) G.pressed = { id: '__close', tid: id };
+  } else if (type === 'move') {
+    if (G.rub && G.rub.id === id) rubMove(x, y);
+  } else if (type === 'up') {
+    if (G.rub && G.rub.id === id) {
+      if (G.rub.moved < 10) tapPet();
+      G.rub = null;
+      return;
+    }
+    if (G.pressed && G.pressed.tid === id) {
+      const pid = G.pressed.id;
+      G.pressed = null;
+      if (pid === '__close') {
+        if (G.over && G.over.tapClose && G.over.t > 0.3) closeOver();
+        return;
+      }
+      const b = findButton(x, y);
+      if (b && b.id === pid && b.onTap) b.onTap();
+    }
+  }
+}
+
+function closeOver() {
+  const o = G.over;
+  G.over = null;
+  sfx.tap();
+  if (o && o.type === 'away' && o.reunion) reunion();
+}
+
+// —— 照顾 ——
+function burst(x, y, kind, n, spread) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const v = (spread || 60) * (0.4 + Math.random() * 0.8);
+    G.parts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v - 40, life: 0.9 + Math.random() * 0.6, t: 0, kind });
+  }
+}
+
+function floatText(text, x, y, col, iconName) {
+  G.floats.push({ text, x, y, t: 0, col: col || PAL.cream2, icon: iconName });
+}
+
+function toast(text, iconName) {
+  G.toast = { text, t: 0, icon: iconName };
+}
+
+function bigMoment(text, who) {
+  G.big = { text, t: 0, who };
+  G.flash = 0.6;
+  G.lampBoost = 0.5;
+  burst(G.pet.x, G.pet.y - 40, 'heart', 22, 140);
+  platform.vibrate(true);
+}
+
+function refuse(why) {
+  sfx.no();
+  platform.vibrate(false);
+  toast(REASON[why] || '现在不行', why === 'tired' ? 'energy' : null);
+  G.pet.react = 0.4;
+}
+
+// 做一件事，成功后的反馈都在这里
+function doAct(kind, opts) {
+  opts = opts || {};
+  const before = Object.assign({}, S.needs);
+  const coverWho = S.cover && S.cover.acts.indexOf(kind) >= 0 ? S.cover.who : null;
+  const r = sim.act(S, kind, 'me', opts);
+  if (r) {
+    refuse(r);
+    return false;
+  }
+  const p = G.pet;
+  const need = sim.ACT_NEED[kind];
+  const gain = Math.round(S.needs[need] - before[need]);
+  if (kind === 'feed') {
+    G.pour = 1.2;
+    p.eat = 2.6;
+    sfx.pour();
+  } else if (kind === 'tuck') {
+    G.blanketDrop = 0.5;
+    sfx.whoosh();
+    sfx.lullaby();
+    burst(p.x, p.y - 30, 'star', 8, 60);
+  } else if (kind === 'pat') {
+    sfx.purr();
+    burst(p.x, p.y - 50, 'heart', 8, 70);
+  } else if (kind === 'clean') {
+    burst(p.x, p.y - 30, 'spark', 14, 90);
+    for (let i = 0; i < 5; i++) setTimeoutGame(() => sfx.bubble(), i * 0.07);
+  }
+  sfx.done();
+  platform.vibrate(false);
+  p.happy = 1.4;
+  p.hop = 0.35;
+  if (gain > 0 && kind !== 'tuck') floatText('+' + gain, needX(need), UI.needsY - 6, PAL.glow, NEED_ICON[need]);
+  if (kind === 'tuck') floatText('晚安', p.x, p.y - 70, PAL.glow, 'rest');
+  if (coverWho) {
+    sfx.cover();
+    bigMoment('你替' + sim.name(coverWho) + sim.VERB[kind], coverWho);
+  } else if (sim.NEEDS.every((k) => S.needs[k] >= 80)) {
+    G.lampBoost = 0.35;
+    burst(p.x, p.y - 40, 'spark', 16, 110);
+    floatText('它很满足', p.x, p.y - 92, PAL.glow);
+  }
+  G.tool = null;
+  save();
+  return true;
+}
+
+// 摸 / 洗：手指在它身上来回划
+function rubMove(x, y) {
+  const r = G.rub;
+  const d = Math.hypot(x - r.x, y - r.y);
+  r.x = x;
+  r.y = y;
+  r.moved += d;
+  if (r.moved < 10) return;
+  const kind = r.kind;
+  const act = kind === 'clean' ? 'clean' : 'pat';
+  const why = sim.check(S, act, 'me');
+  r.dist += d;
+  r.step += d;
+  if (r.step > 22) {
+    r.step = 0;
+    if (kind === 'clean') {
+      G.parts.push({ x: x + (Math.random() - 0.5) * 16, y: y + (Math.random() - 0.5) * 10, vx: (Math.random() - 0.5) * 20, vy: -30, life: 0.9, t: 0, kind: 'bubble' });
+      sfx.bubble();
+    } else {
+      G.parts.push({ x, y: y - 8, vx: (Math.random() - 0.5) * 30, vy: -50, life: 0.8, t: 0, kind: 'heart' });
+      if (G.t - r.lastSnd > 0.3) {
+        r.lastSnd = G.t;
+        if (S.sulk && Math.random() < 0.5) sfx.sulk();
+        else sfx.purr();
+      }
+    }
+    G.pet.happy = Math.max(G.pet.happy, 0.25);
+  }
+  if (why) {
+    if (!r.warned) {
+      r.warned = true;
+      toast(REASON[why], why === 'tired' ? 'energy' : null);
+    }
+    return;
+  }
+  const need = act === 'clean' ? config.acts.clean.rubDist : config.acts.pat.rubDist * (S.sulk ? config.acts.pat.sulkRubMul : 1);
+  r.need = need;
+  if (r.dist >= need) {
+    r.dist = 0;
+    doAct(act);
+  }
+}
+
+function tapPet() {
+  const p = G.pet;
+  if (S.asleep) {
+    toast('嘘…它在睡');
+    sfx.tap();
+    return;
+  }
+  if (S.sulk) {
+    sfx.sulk();
+    p.react = 0.5;
+    toast('它在闹脾气，多摸一会儿');
+    return;
+  }
+  sfx.meow();
+  p.hop = 0.3;
+  p.happy = 0.6;
+  G.hint = Math.max(G.hint, 1.2);
+}
+
+function needX(k) {
+  return 12 + sim.NEEDS.indexOf(k) * 89 + 44;
+}
+
+function onActButton(kind) {
+  if (kind === 'feed' || kind === 'tuck') {
+    doAct(kind);
+    return;
+  }
+  const why = sim.check(S, kind, 'me');
+  if (why) {
+    refuse(why);
+    return;
+  }
+  if (kind === 'clean') {
+    G.tool = G.tool === 'clean' ? null : 'clean';
+    G.hint = 2.5;
+  } else {
+    G.tool = null;
+    G.hint = 2.5;
+  }
+}
+
+// —— 广告（假的）——
+function watchAd(label, onDone) {
+  sfx.ad();
+  const real = platform.showRewardedAd(config.rewardedAdUnitId, onDone, () => toast('没看完，不算'));
+  if (!real) G.over = { type: 'ad', label, t: 0, done: onDone };
+}
+
+function coverByAd() {
+  if (!S.cover) return;
+  const kind = S.cover.acts[0];
+  const who = S.cover.who;
+  watchAd('替' + sim.name(who) + '代' + sim.SHORT[kind] + '一次', () => {
+    const r = doAct(kind, { free: true });
+    if (!r) toast('现在做不了，' + REASON[sim.check(S, kind, 'ad')]);
+  });
+}
+
+function doctorByAd() {
+  watchAd('请医生', () => {
+    if (sim.doctor(S)) {
+      sfx.cured();
+      bigMoment('医生来过了，它好了');
+      burst(G.pet.x, G.pet.y - 30, 'spark', 20, 120);
+      save();
+    }
+  });
+}
+
+// —— 朋友、角落 ——
+function collectHeart(id) {
+  if (!sim.collectHeart(S, id)) return;
+  const c = R.corners[id];
+  sfx.heart();
+  platform.vibrate(false);
+  burst(c.x, c.y - 70, 'heart', 10, 80);
+  floatText('+1', 60, 30, PAL.glow, 'energy');
+  G.parts.push({ x: c.x, y: c.y - 70, tx: 60, ty: 28, t: 0, life: 0.6, kind: 'fly' });
+  save();
+}
+
+function sendTo(id, what) {
+  const r = sim.send(S, id, what);
+  if (r === 'already') {
+    toast('今天已经留过了');
+    sfx.no();
+    return;
+  }
+  const c = R.corners[id];
+  if (what === 'heart') {
+    sfx.heart();
+    burst(c.x, c.y - 60, 'heart', 12, 70);
+    toast('留给' + sim.name(id) + '：她今天更可能会来', 'heartSend');
+  } else {
+    sfx.knock();
+    G.doorShake = 0.5;
+    toast('咚咚');
+  }
+  platform.vibrate(false);
+  G.over = null;
+  save();
+}
+
+function placeFurniture(kind) {
+  S.furniture.me = kind;
+  S.log.push({ t: Math.round(S.t), who: 'me', text: '在角落放了一件' + pix.FURN_NAME[kind], kind: 'furn' });
+  sfx.place();
+  burst(R.corners.me.x, R.corners.me.y - 30, 'spark', 14, 90);
+  platform.vibrate(false);
+  G.over = null;
+  save();
+}
+
+function reunion() {
+  sfx.reunion();
+  bigMoment('它一直在等你');
+  G.pet.hop = 0.6;
+  G.pet.happy = 2.5;
+}
+
+// 游戏时间里的小定时器（按秒）
+const timers = [];
+function setTimeoutGame(fn, sec) {
+  timers.push({ fn, at: G.t + sec });
+}
+
+// 规则层发来的事件（只在你正看着的时候演出来）
+function handleEvents() {
+  const ev = S.events;
+  S.events = [];
+  for (const e of ev) {
+    if (e.type === 'arrive') {
+      G.visitors[e.who] = 6;
+      sfx.bell();
+      toast(sim.name(e.who) + ' 来了');
+    } else if (e.type === 'knock') {
+      G.doorShake = 0.6;
+      setTimeoutGame(() => sfx.knock(), 0.8);
+    } else if (e.type === 'absent') {
+      sfx.absent();
+      platform.vibrate(false);
+    } else if (e.type === 'sick') {
+      sfx.sick();
+      platform.vibrate(true);
+      toast('它生病了', 'sick');
+    } else if (e.type === 'corner') {
+      sfx.sulk();
+      toast('它去' + sim.name(e.who) + '那边了');
+    } else if (e.type === 'back') {
+      sfx.meow();
+    }
+  }
+}
+
+function fastForward() {
+  sfx.ff();
+  G.ffCount++;
+  catchUp(config.time.fastForwardMin, '快进了 ' + config.time.fastForwardMin / 60 + ' 小时');
+  G.bars = G.bars || Object.assign({}, S.needs);
+  save();
+}
+
+// ———————————————————— 每帧 ————————————————————
+function update(dt) {
+  G.t += dt;
+  for (let i = timers.length - 1; i >= 0; i--) if (G.t >= timers[i].at) { timers[i].fn(); timers.splice(i, 1); }
+  if (G.over) G.over.t += dt;
+  if (G.over && G.over.type === 'ad' && G.over.t >= config.fakeAdSec) {
+    const done = G.over.done;
+    G.over = null;
+    done();
+  }
+  if (G.mode !== 'room') return;
+  // 游戏时间往前走
+  sim.advance(S, (dt / 60) * config.time.gamePerRealMin);
+  handleEvents();
+  G.saveT += dt;
+  if (G.saveT > 5) {
+    G.saveT = 0;
+    save();
+  }
+  // 需求条平滑追上
+  for (const k of sim.NEEDS) {
+    const d = S.needs[k] - G.bars[k];
+    G.bars[k] += Math.abs(d) < 0.3 ? d : d * Math.min(1, dt * 5);
+  }
+  for (const k in G.visitors) {
+    G.visitors[k] -= dt;
+    if (G.visitors[k] <= 0) delete G.visitors[k];
+  }
+  // 朋友来访期间在角落站着（游戏时间里）
+  for (const f of config.friends) {
+    if (S.friends[f.id].visitUntil > S.t && !G.visitors[f.id]) G.visitors[f.id] = 0.5;
+  }
+  const p = G.pet;
+  p.hop = Math.max(0, p.hop - dt);
+  p.happy = Math.max(0, p.happy - dt);
+  p.eat = Math.max(0, p.eat - dt);
+  p.react = Math.max(0, p.react - dt);
+  G.hint = Math.max(0, G.hint - dt);
+  G.flash = Math.max(0, G.flash - dt);
+  G.lampBoost = Math.max(0, G.lampBoost - dt * 0.5);
+  G.doorShake = Math.max(0, G.doorShake - dt);
+  G.blanketDrop = Math.max(0, G.blanketDrop - dt);
+  G.pour = Math.max(0, G.pour - dt);
+  if (G.pour > 0 && Math.random() < 0.6) G.parts.push({ x: R.bowl.x + (Math.random() - 0.5) * 10, y: R.bowl.y - 60, vx: (Math.random() - 0.5) * 20, vy: 80, life: 0.6, t: 0, kind: 'kibble' });
+  if (p.eat > 0 && Math.floor(p.eat * 4) !== Math.floor((p.eat + dt) * 4)) sfx.nom();
+  // 眨眼
+  p.nextBlink -= dt;
+  if (p.nextBlink <= 0) {
+    p.blink = 0.13;
+    p.nextBlink = 2 + Math.random() * 3;
+  }
+  p.blink = Math.max(0, p.blink - dt);
+  // 它要去哪
+  let tx = R.pet.x;
+  let ty = R.pet.y;
+  if (S.corner) {
+    tx = R.corners[S.corner].petX;
+    ty = R.corners[S.corner].y + 24;
+  } else if (p.eat > 0) {
+    tx = R.bowl.x + 34;
+    ty = R.bowl.y;
+  } else if (!S.asleep && !S.sick) {
+    p.wander -= dt;
+    if (p.wander <= 0) {
+      p.wander = 5 + Math.random() * 6;
+      p.wx = S.sulk ? 0 : Math.random() < 0.5 ? 0 : (Math.random() - 0.5) * 70;
+    }
+    tx += p.wx;
+  }
+  if (S.asleep || S.sick) {
+    if (!S.corner) {
+      tx = R.pet.x;
+      ty = R.pet.y;
+    }
+  }
+  const dx = tx - p.x;
+  const dy = ty - p.y;
+  const dist = Math.hypot(dx, dy);
+  const sp = S.asleep ? 400 : 70;
+  if (dist > 1) {
+    const k = Math.min(1, (sp * dt) / dist);
+    p.x += dx * k;
+    p.y += dy * k;
+    if (Math.abs(dx) > 1) p.face = dx > 0 ? 1 : -1;
+    p.walking = dist > 3 && !S.asleep;
+  } else p.walking = false;
+  // 想念：望向很久没来的人的角落
+  p.lookT -= dt;
+  if (p.lookT <= 0) {
+    p.lookT = 3 + Math.random() * 2;
+    const miss = Object.keys(S.missing).filter((k) => k !== 'me');
+    p.lookAt = miss.length && !S.asleep ? miss[Math.floor(Math.random() * miss.length)] : null;
+  }
+  // 粒子
+  for (const q of G.parts) {
+    q.t += dt;
+    if (q.kind === 'fly') continue;
+    q.x += q.vx * dt;
+    q.y += q.vy * dt;
+    if (q.kind === 'kibble') {
+      q.vy += 300 * dt;
+      if (q.y > R.bowl.y - 10) q.life = 0;
+    } else if (q.kind === 'bubble' || q.kind === 'heart' || q.kind === 'zzz' || q.kind === 'note') q.vy -= 10 * dt;
+    else q.vy += 120 * dt;
+  }
+  G.parts = G.parts.filter((q) => q.t < q.life);
+  for (const f of G.floats) f.t += dt;
+  G.floats = G.floats.filter((f) => f.t < 1.4);
+  if (G.toast) {
+    G.toast.t += dt;
+    if (G.toast.t > 1.8) G.toast = null;
+  }
+  if (G.big) {
+    G.big.t += dt;
+    if (G.big.t > 2.2) G.big = null;
+  }
+  // 睡觉冒 Z，唱片机冒音符
+  if (S.asleep && Math.random() < dt * 0.8) G.parts.push({ x: p.x + 20, y: p.y - 40, vx: 10, vy: -16, life: 2.2, t: 0, kind: 'zzz' });
+  if (G.visitors.c && Math.random() < dt * 1.5) G.parts.push({ x: R.corners.c.x - 10, y: R.corners.c.y - 60, vx: 8, vy: -20, life: 1.8, t: 0, kind: 'note' });
+}
+
+// ———————————————————— 画 ————————————————————
+function text(str, x, y, size, col, align, weight) {
+  ctx.font = (weight || 700) + ' ' + size + 'px ' + FONT;
+  ctx.textAlign = align || 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = col || PAL.cream2;
+  ctx.fillText(str, x, y);
+}
+
+function textOutlined(str, x, y, size, col, align) {
+  ctx.font = '800 ' + size + 'px ' + FONT;
+  ctx.textAlign = align || 'center';
+  ctx.textBaseline = 'middle';
+  ctx.lineJoin = 'round';
+  ctx.lineWidth = Math.max(3, size / 5);
+  ctx.strokeStyle = PAL.out;
+  ctx.strokeText(str, x, y);
+  ctx.fillStyle = col || PAL.cream2;
+  ctx.fillText(str, x, y);
+}
+
+// 像素风面板：深色描边 + 底色 + 下沿一层阴影
+function panel(x, y, w, h, col, shade) {
+  ctx.fillStyle = PAL.out;
+  ctx.fillRect(x - 3, y, w + 6, h);
+  ctx.fillRect(x, y - 3, w, h + 6);
+  ctx.fillStyle = shade || '#241b26';
+  ctx.fillRect(x, y, w, h);
+  ctx.fillStyle = col || '#33263a';
+  ctx.fillRect(x, y, w, h - 4);
+}
+
+function button(id, x, y, w, h, onTap, draw, opt) {
+  opt = opt || {};
+  const down = G.pressed && G.pressed.id === id;
+  const oy = down ? 2 : 0;
+  if (!opt.bare) panel(x, y + oy, w, h - oy, opt.col || '#4a3848', opt.shade || '#2e2230');
+  draw(x, y + oy, w, h, down);
+  G.buttons.push({ id, x, y, w, h, onTap });
+}
+
+function drawTopBar() {
+  ctx.fillStyle = '#1c141e';
+  ctx.fillRect(0, 0, L.W, TOP);
+  ctx.fillStyle = PAL.out;
+  ctx.fillRect(0, TOP - 3, L.W, 3);
+  const day = Math.floor(S.t / 1440) + 1;
+  const m = Math.floor(S.t % 1440);
+  const hh = Math.floor(m / 60);
+  const mm = m % 60;
+  const night = hh >= 19 || hh < 6;
+  pix.icon(ctx, night ? 'rest' : 'energy', 20, 28, 20);
+  text((hh < 10 ? '0' : '') + hh + ':' + (mm < 10 ? '0' : '') + mm, 36, 23, 18, PAL.cream2, 'left', 800);
+  text('第 ' + day + ' 天', 37, 42, 11, '#a8949c', 'left', 600);
+  // 精力：一格一盏小灯火
+  const n = Math.max(config.energy.max, S.energy);
+  const ex = 116;
+  for (let i = 0; i < n; i++) {
+    const on = i < S.energy;
+    const x = ex + i * 26;
+    pix.icon(ctx, 'energy', x, 28, 22, on ? 1 : 0.22);
+    if (!on && i === S.energy) {
+      // 下一格还要多久
+      const k = S.energyAcc / config.energy.regenMin;
+      ctx.fillStyle = PAL.glow;
+      ctx.fillRect(x - 9, 43, 18 * k, 3);
+      ctx.fillStyle = 'rgba(255,217,138,0.25)';
+      ctx.fillRect(x - 9 + 18 * k, 43, 18 * (1 - k), 3);
+    }
+  }
+  text('精力', ex - 18, 28, 10, '#a8949c', 'center', 600);
+  // 调试：快进
+  button('ff', L.W - 92, 12, 82, 32, fastForward, (x, y, w, h) => {
+    pix.icon(ctx, 'ff', x + 17, y + 14, 16);
+    text('快进3h', x + 52, y + 14, 12, PAL.cream2, 'center', 700);
+  }, { col: '#3a3048', shade: '#262032' });
+  text('调试', L.W - 51, 50, 8, '#6f5f6a', 'center', 600);
+}
+
+function drawPetAndRoom() {
+  const t = G.t;
+  const hour = (S.t % 1440) / 60;
+  room.drawRoom(ctx, R, { t, hour, lampBoost: G.lampBoost, doorShake: G.doorShake > 0 });
+  const frame = Math.floor(t * 4) % 8;
+  // 角落：你（窗下，最靠后）、小C、阿树
+  room.drawCorner(ctx, R, 'me', S.furniture.me, frame, { empty: true, t });
+  room.drawCorner(ctx, R, 'c', 'record', G.visitors.c ? frame : 0);
+  room.drawCorner(ctx, R, 's', 'plant', Math.floor(t * 0.7) % 2);
+  G.buttons.push({ id: 'corner_me', x: R.corners.me.x - 45, y: R.corners.me.y - 70, w: 90, h: 76, onTap: () => openFurn() });
+  for (const id of ['c', 's']) {
+    const c = R.corners[id];
+    G.buttons.push({ id: 'corner_' + id, x: c.x - 50, y: c.y - 80, w: 100, h: 92, onTap: () => (S.hearts[id] ? collectHeart(id) : openFriend(id)) });
+  }
+  // 碗
+  drawBowl();
+  // 朋友来了：站在她的角落
+  for (const id of ['c', 's']) {
+    if (!G.visitors[id]) continue;
+    const c = R.corners[id];
+    const sp = pix.personSprite(id, { b: Math.floor(t * 1.5) % 2, wave: Math.floor(t * 2) % 2 === 0, blink: Math.floor(t * 10) % 37 === 0 });
+    pix.blitBottom(ctx, sp, c.x + (id === 'c' ? -22 : 22), c.y + 4, 3);
+  }
+  // 名牌 + 爱心 + 缺席
+  for (const id of ['c', 's', 'me']) drawNameplate(id);
+  drawPet();
+}
+
+function drawBowl() {
+  const b = R.bowl;
+  room.ellipse(ctx, b.x, b.y + 2, 24, 6, 'rgba(20,12,18,0.4)');
+  const bowl = pix.cached('bowl', () => {
+    const g = new pix.Grid(16, 7);
+    for (let j = 0; j < 6; j++) g.rect(j * 0.5, j + 1, 16 - j, 1, j > 3 ? PAL.coralS : PAL.coral);
+    g.rect(1, 1, 14, 1, '#f08a76');
+    return g.runs();
+  });
+  // 碗里还剩多少：跟饱不饱走
+  const fill = Math.round((G.bars.food / 100) * 5);
+  if (fill > 0) {
+    ctx.fillStyle = '#c98a4a';
+    for (let i = 0; i < fill * 2; i++) ctx.fillRect(b.x - 15 + ((i * 7) % 30), b.y - 21 + (i % 2) * 3 - Math.min(fill, 2) * 1.5, 3, 3);
+  }
+  pix.blitBottom(ctx, bowl, b.x, b.y, 3);
+  // 痕迹：最后是谁喂的
+  const lb = S.lastBy.feed;
+  if (lb && S.t - lb.t < 720) {
+    drawBadge(lb.who, b.x + 22, b.y - 26, 14);
+  }
+}
+
+function drawBadge(who, x, y, s) {
+  ctx.fillStyle = PAL.out;
+  ctx.fillRect(x - s / 2 - 2, y - s / 2 - 2, s + 4, s + 4);
+  ctx.fillStyle = who === 'me' ? '#8f4e3a' : who === 'c' ? '#56653d' : '#3f5878';
+  ctx.fillRect(x - s / 2, y - s / 2, s, s);
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(x - s / 2, y - s / 2, s, s);
+  ctx.clip();
+  pix.avatar(ctx, who, x, y + s * 0.08, s * 1.05);
+  ctx.restore();
+}
+
+function drawNameplate(id) {
+  const c = R.corners[id];
+  const t = G.t;
+  const y = id === 'me' ? c.y + 14 : c.y + 18;
+  const x = id === 'me' ? c.x + 52 : c.x;
+  const absent = S.cover && S.cover.who === id;
+  const away = id !== 'me' && S.t < S.friends[id].tripUntil;
+  ctx.globalAlpha = absent || away ? 0.55 : 1;
+  drawBadge(id, x, y, 18);
+  ctx.globalAlpha = 1;
+  if (absent || away) {
+    // 缺席：头像右上角一个小月亮 / 行李箱
+    pix.icon(ctx, away ? 'door' : 'rest', x + 11, y - 10, 12);
+  }
+  if (id !== 'me' && S.hearts[id]) {
+    const hy = c.y - 84 + Math.sin(t * 3) * 3;
+    pix.icon(ctx, 'love', c.x, hy, 22);
+    if (Math.floor(t * 2) % 2) {
+      ctx.fillStyle = PAL.glow;
+      ctx.fillRect(c.x + 12, hy - 12, 3, 3);
+    }
+  }
+}
+
+function petPose() {
+  const p = G.pet;
+  const t = G.t;
+  const o = { b: 0, eye: 'open', look: 0, tail: Math.floor(t * 4) % 8, dirt: S.needs.clean < 25 ? 3 : S.needs.clean < 45 ? 2 : S.needs.clean < 65 ? 1 : 0, blush: S.sick, frame: 0, flip: false };
+  const breathRate = S.asleep || S.sick ? 0.35 : 0.6;
+  o.b = Math.sin(t * Math.PI * 2 * breathRate) > 0 ? 1 : 0;
+  if (S.sick) {
+    o.pose = 'lie';
+    o.eye = p.blink > 0 ? 'shut' : 'half';
+  } else if (S.asleep) {
+    o.pose = 'lie';
+    o.eye = 'shut';
+  } else if (p.walking) {
+    o.pose = 'walk';
+    o.frame = Math.floor(t * 8) % 2;
+    o.flip = p.face > 0;
+    o.eye = p.blink > 0 ? 'shut' : 'open';
+  } else if (p.eat > 0) {
+    o.pose = 'eat';
+    o.eye = 'happy';
+  } else if (S.sulk && !(G.rub && p.happy > 0)) {
+    o.pose = 'back';
+    o.tail = Math.floor(t * 10) % 8;
+  } else {
+    o.pose = 'sit';
+    o.eye = p.happy > 0 || (G.rub && G.rub.moved > 10) ? 'happy' : p.blink > 0 ? 'shut' : 'open';
+    if (p.lookAt) o.look = R.corners[p.lookAt].x < p.x ? -1 : 1;
+  }
+  return o;
+}
+
+function drawPet() {
+  const p = G.pet;
+  const o = petPose();
+  const sp = pix.petSprite(o);
+  const hop = p.hop > 0 ? Math.sin((p.hop / 0.35) * Math.PI) * 8 : 0;
+  const shake = p.react > 0 ? Math.sin(G.t * 50) * 2 : 0;
+  // 影子
+  room.ellipse(ctx, p.x, p.y + 1, o.pose === 'lie' ? 45 : 30, 6, 'rgba(20,10,16,0.45)');
+  pix.blitBottom(ctx, sp, Math.round(p.x + shake), Math.round(p.y - hop), 3);
+  const top = p.y - (o.pose === 'lie' ? 48 : 78) - hop;
+  // 被子
+  if (S.asleep && S.blanket) {
+    const drop = G.blanketDrop > 0 ? (G.blanketDrop / 0.5) * 60 : 0;
+    drawBlanket(p.x + 9, p.y - 33 - drop, S.blanket);
+  }
+  // 生病：体温计 + 冒汗
+  if (S.sick) {
+    pix.icon(ctx, 'sick', p.x - 52, p.y - 44 + Math.sin(G.t * 2) * 2, 22);
+    if (Math.floor(G.t * 2) % 2) {
+      ctx.fillStyle = PAL.blue;
+      ctx.fillRect(p.x - 6, top + 4, 3, 6);
+    }
+  }
+  // 闹脾气：头上一团乱线
+  if (S.sulk && !S.asleep && !S.sick) {
+    const sx = p.x + 6;
+    const sy = top - 6 + Math.sin(G.t * 6) * 2;
+    ctx.fillStyle = PAL.out;
+    for (let i = 0; i < 10; i++) {
+      const a = i * 1.9 + G.t * 4;
+      ctx.fillRect(Math.round(sx + Math.cos(a) * (5 + (i % 3) * 3)), Math.round(sy + Math.sin(a) * 4), 3, 3);
+    }
+  }
+  // 想念：头上的泡泡里是那个人的脸
+  if (p.lookAt && !S.asleep && !S.sick && !S.sulk) {
+    const bx = p.x + (R.corners[p.lookAt].x < p.x ? -40 : 40);
+    const by = top - 14;
+    ctx.fillStyle = PAL.out;
+    ctx.fillRect(bx - 17, by - 17, 34, 34);
+    ctx.fillStyle = PAL.cream2;
+    ctx.fillRect(bx - 15, by - 15, 30, 30);
+    ctx.fillStyle = PAL.out;
+    ctx.fillRect(bx - (bx < p.x ? -12 : 15), by + 18, 6, 6);
+    ctx.fillRect(bx - (bx < p.x ? -18 : 21), by + 27, 3, 3);
+    pix.avatar(ctx, p.lookAt, bx, by + 1, 26);
+  }
+  // 摸 / 洗的进度圈
+  if (G.rub && G.rub.need && G.rub.moved > 10) {
+    const k = Math.min(1, G.rub.dist / G.rub.need);
+    ctx.strokeStyle = PAL.out;
+    ctx.lineWidth = 7;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y - 40, 50, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * k);
+    ctx.stroke();
+    ctx.strokeStyle = G.rub.kind === 'clean' ? PAL.blue : PAL.coral;
+    ctx.lineWidth = 4;
+    ctx.stroke();
+  }
+  // 提示：在它身上来回划
+  if (G.hint > 0 || G.firstRoomHint > 0) {
+    const ix = p.x + Math.sin(G.t * 6) * 24;
+    const iy = p.y - 50 + Math.cos(G.t * 12) * 3;
+    pix.icon(ctx, G.tool === 'clean' ? 'sponge' : 'hand', ix, iy, 30, 0.9);
+  }
+  if (G.tool === 'clean' && !G.hint) {
+    pix.icon(ctx, 'sponge', p.x + 46, p.y - 70 + Math.sin(G.t * 4) * 3, 24);
+  }
+}
+
+function drawBlanket(cx, cy, who) {
+  const col = who === 'me' ? ['#c8664a', '#9e4c36', '#e08a6a'] : who === 'c' ? ['#76874f', '#5a6a3b', '#94a56a'] : ['#557aa6', '#3f5d84', '#7a9cc4'];
+  const sp = pix.cached('blanket|' + who, () => {
+    const g = new pix.Grid(24, 11);
+    g.rect(0, 1, 24, 10, col[0], col[1]);
+    for (let j = 0; j < 9; j += 3) for (let i = (j / 3) % 2 ? 0 : 3; i < 22; i += 6) g.rect(i + 1, j + 2, 3, 3, col[2]);
+    g.rect(0, 0, 24, 2, PAL.cream2);
+    return g.runs();
+  });
+  pix.blit(ctx, sp, Math.round(cx - 36), Math.round(cy), 3);
+}
+
+function drawParticles() {
+  for (const q of G.parts) {
+    const k = 1 - q.t / q.life;
+    ctx.globalAlpha = Math.max(0, Math.min(1, k * 1.5));
+    if (q.kind === 'heart') pix.icon(ctx, 'love', q.x, q.y, 12);
+    else if (q.kind === 'bubble') {
+      ctx.fillStyle = PAL.out;
+      ctx.fillRect(q.x - 4, q.y - 4, 9, 9);
+      ctx.fillStyle = '#dff1f7';
+      ctx.fillRect(q.x - 3, q.y - 3, 7, 7);
+      ctx.fillStyle = PAL.white;
+      ctx.fillRect(q.x - 2, q.y - 2, 2, 2);
+    } else if (q.kind === 'kibble') {
+      ctx.fillStyle = '#c98a4a';
+      ctx.fillRect(q.x, q.y, 3, 3);
+    } else if (q.kind === 'star' || q.kind === 'spark') {
+      ctx.fillStyle = q.kind === 'star' ? PAL.glow : PAL.white;
+      ctx.fillRect(q.x - 1, q.y - 4, 3, 9);
+      ctx.fillRect(q.x - 4, q.y - 1, 9, 3);
+    } else if (q.kind === 'zzz') textOutlined('z', q.x, q.y, 10 + q.t * 4, PAL.cream2);
+    else if (q.kind === 'note') textOutlined('♪', q.x, q.y, 12, PAL.glow);
+    else if (q.kind === 'fly') {
+      const e = q.t / q.life;
+      pix.icon(ctx, 'love', q.x + (q.tx - q.x) * e, q.y + (q.ty - q.y) * e - Math.sin(e * Math.PI) * 40, 16);
+    }
+  }
+  ctx.globalAlpha = 1;
+  for (const f of G.floats) {
+    const k = f.t / 1.4;
+    ctx.globalAlpha = 1 - k * k;
+    const y = f.y - k * 34;
+    if (f.icon) {
+      pix.icon(ctx, f.icon, f.x - 16, y, 16);
+      textOutlined(f.text, f.x + 8, y, 15, f.col);
+    } else textOutlined(f.text, f.x, y, 15, f.col);
+    ctx.globalAlpha = 1;
+  }
+}
+
+// 横幅：朋友没来 / 生病
+function drawBanners() {
+  let y = R.top + 8;
+  if (S.sick) {
+    panel(12, y, L.W - 24, 50, '#5a2f36', '#3e1f26');
+    pix.icon(ctx, 'sick', 34, y + 23, 26);
+    text('它生病了', 54, y + 16, 15, PAL.cream2, 'left', 800);
+    text('不请医生，要都养好 10 小时才自己好', 54, y + 34, 10, '#e0b8b0', 'left', 500);
+    button('doctor', L.W - 124, y + 8, 104, 34, doctorByAd, (x, yy, w, h) => {
+      pix.icon(ctx, 'ad', x + 18, yy + 15, 18);
+      text('请医生', x + 62, yy + 15, 14, PAL.white, 'center', 800);
+    }, { col: '#c8664a', shade: '#9e4c36' });
+    y += 58;
+  }
+  if (S.cover && S.t <= S.cover.until) {
+    const who = S.cover.who;
+    const kind = S.cover.acts[0];
+    panel(12, y, L.W - 24, 54, '#2f3a4a', '#202836');
+    drawBadge(who, 36, y + 25, 30);
+    pix.icon(ctx, 'rest', 50, y + 11, 13);
+    text(sim.name(who) + ' 没来', 60, y + 15, 14, PAL.cream2, 'left', 800);
+    text(S.cover.reason, 60, y + 32, 10, '#a9b8c8', 'left', 500);
+    const left = Math.max(0, Math.round((S.cover.until - S.t) / 60));
+    text('还剩' + left + 'h', 132, y + 32, 10, '#a9b8c8', 'left', 500);
+    button('cover_me', L.W - 186, y + 9, 76, 36, () => doAct(kind), (x, yy, w, h) => {
+      pix.icon(ctx, ACT_ICON[kind], x + 18, yy + 16, 20);
+      text('我来', x + 50, yy + 10, 12, PAL.cream2, 'center', 800);
+      pix.icon(ctx, 'energy', x + 44, yy + 25, 10);
+      text('-1', x + 56, yy + 25, 9, PAL.glow, 'center', 700);
+    }, { col: '#4a5a6e', shade: '#33404f' });
+    button('cover_ad', L.W - 104, y + 9, 84, 36, coverByAd, (x, yy, w, h) => {
+      pix.icon(ctx, 'ad', x + 15, yy + 16, 18);
+      text('代' + ACT_LABEL[kind], x + 52, yy + 10, 12, PAL.white, 'center', 800);
+      text('看广告', x + 52, yy + 25, 9, '#ffe2c8', 'center', 600);
+    }, { col: '#c8664a', shade: '#9e4c36' });
+  }
+}
+
+function drawNeeds() {
+  const y = UI.needsY;
+  for (const k of sim.NEEDS) {
+    const x = needX(k) - 40;
+    const v = G.bars[k];
+    const low = v < config.needs.lowAt;
+    const blink = low && Math.floor(G.t * 3) % 2;
+    pix.icon(ctx, NEED_ICON[k], x + 10, y + 12, 20);
+    // 条
+    ctx.fillStyle = PAL.out;
+    ctx.fillRect(x + 22, y + 5, 58, 14);
+    ctx.fillStyle = '#2a2030';
+    ctx.fillRect(x + 24, y + 7, 54, 10);
+    const col = v < config.needs.lowAt ? (blink ? '#ff7a5a' : PAL.coral) : v < 60 ? PAL.mustard : '#8fbf6a';
+    const w = Math.max(0, Math.round((54 * v) / 100 / 3) * 3);
+    ctx.fillStyle = col;
+    ctx.fillRect(x + 24, y + 7, w, 10);
+    ctx.fillStyle = 'rgba(0,0,0,0.25)';
+    ctx.fillRect(x + 24, y + 14, w, 3);
+    ctx.fillStyle = 'rgba(255,255,255,0.25)';
+    ctx.fillRect(x + 24, y + 7, w, 2);
+  }
+  // 现在最急的一件，用一行小字说
+  const st = S.sick ? '生病了' : S.corner ? '在' + sim.name(S.corner) + '的角落生闷气' : S.sulk ? '在闹脾气' : S.asleep ? (S.blanket ? sim.name(S.blanket) === '你' ? '盖着你的被子睡' : '盖着' + sim.name(S.blanket) + '的被子睡' : '睡在地板上') : '';
+  if (st) text(config.petName + ' ' + st, L.W / 2, y + 34, 11, S.sick || S.sulk || S.corner ? '#f0a090' : '#b8a8b0', 'center', 600);
+}
+
+function drawActButtons() {
+  for (const b of UI.btns) {
+    const why = sim.check(S, b.act, 'me');
+    const dim = why === 'tired' || why === 'asleep' || why === 'notSleepy' || why === 'full';
+    const down = G.pressed && G.pressed.id === b.id;
+    const active = G.tool === 'clean' && b.act === 'clean';
+    const oy = down ? 3 : 0;
+    // 圆按钮（像素圆）
+    room.ellipse(ctx, b.x, b.y + 4, b.r + 3, b.r + 3, PAL.out);
+    room.ellipse(ctx, b.x, b.y + 3, b.r, b.r, active ? '#9e4c36' : '#2a1f2c');
+    room.ellipse(ctx, b.x, b.y + oy, b.r + 3, b.r + 3, PAL.out);
+    room.ellipse(ctx, b.x, b.y + oy, b.r, b.r, active ? '#c8664a' : dim ? '#3a2e3c' : '#5a4458');
+    room.ellipse(ctx, b.x - 6, b.y - 8 + oy, b.r - 12, b.r - 16, active ? '#d97a5a' : dim ? '#3e3240' : '#664e64');
+    pix.icon(ctx, ACT_ICON[b.act], b.x, b.y - 3 + oy, 34, dim ? 0.4 : 1);
+    text(ACT_LABEL[b.act], b.x, b.y + 22 + oy, 11, dim ? '#7a6a74' : PAL.cream2, 'center', 800);
+    // 这件事最近是谁做的：小头像
+    const lb = S.lastBy[b.act];
+    if (lb && S.t - lb.t < 720) drawBadge(lb.who, b.x + b.r - 6, b.y - b.r + 6, 14);
+    // 现在最需要的一件：一圈光
+    const need = sim.ACT_NEED[b.act];
+    if (!dim && S.needs[need] < config.needs.lowAt) {
+      ctx.strokeStyle = 'rgba(255,217,138,' + (0.4 + Math.sin(G.t * 6) * 0.3).toFixed(2) + ')';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(b.x, b.y + oy, b.r + 7, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    G.buttons.push({ id: b.id, x: b.x, y: b.y, r: b.r, onTap: () => onActButton(b.act) });
+  }
+}
+
+function drawTraceStrip() {
+  const y = UI.traceY;
+  const last = S.log.slice().reverse().find((e) => e.kind !== 'furn') || S.log[S.log.length - 1];
+  button('log', 12, y, L.W - 84, 44, () => { G.over = { type: 'log', t: 0, tapClose: true }; sfx.tap(); }, (x, yy, w, h) => {
+    pix.icon(ctx, 'log', x + 16, yy + 20, 20);
+    if (last) {
+      drawBadge(last.who, x + 40, yy + 20, 20);
+      fitText(sim.line(last, S.t), x + 56, yy + 20, w - 62, 12, PAL.cream2);
+    } else text('还没有人来过', x + 56, yy + 20, 12, '#a8949c', 'left', 600);
+  }, { col: '#33263a', shade: '#241b26' });
+  button('share', L.W - 62, y, 50, 44, openShare, (x, yy, w, h) => {
+    pix.icon(ctx, 'share', x + 25, yy + 16, 20);
+    text('叫朋友', x + 25, yy + 33, 9, PAL.cream2, 'center', 700);
+  }, { col: '#4f7a6e', shade: '#3c6056' });
+}
+
+// 一行放不下就缩小字号
+function fitText(str, x, y, maxW, size, col) {
+  let s = size;
+  ctx.font = '600 ' + s + 'px ' + FONT;
+  while (s > 9 && ctx.measureText(str).width > maxW) {
+    s -= 0.5;
+    ctx.font = '600 ' + s + 'px ' + FONT;
+  }
+  let out = str;
+  while (ctx.measureText(out).width > maxW && out.length > 2) out = out.slice(0, -2) + '…';
+  text(out, x, y, s, col, 'left', 600);
+}
+
+// ———— 弹层 ————
+function dim(a) {
+  ctx.fillStyle = 'rgba(10,6,14,' + (a == null ? 0.72 : a) + ')';
+  ctx.fillRect(0, 0, L.W, L.H);
+}
+
+function drawAway(o) {
+  dim();
+  const lines = o.lines.slice(-7);
+  const h = 166 + Math.max(1, lines.length) * 34;
+  const y = Math.max(60, (L.H - h) / 2);
+  panel(24, y, L.W - 48, h, '#33263a', '#241b26');
+  text(o.title, L.W / 2, y + 26, 17, PAL.glow, 'center', 800);
+  // 下一步该做什么：它最缺的那样
+  const wk = sim.worst(S);
+  if (wk !== 'ok') {
+    const ic = wk === 'sick' ? 'sick' : NEED_ICON[wk];
+    text('它最缺', L.W - 76, y + 50, 10, '#f0a090', 'right', 700);
+    pix.icon(ctx, ic, L.W - 62, y + 50, 18);
+  }
+  // 它现在的样子
+  const sp = pix.petSprite(petPose());
+  pix.blitBottom(ctx, sp, L.W / 2, y + 102, 2.4);
+  if (!lines.length) text('屋里很安静', L.W / 2, y + 122, 12, '#a8949c');
+  lines.forEach((e, i) => {
+    const ly = y + 124 + i * 34;
+    drawBadge(e.who, 50, ly, 22);
+    fitText(sim.line(e, S.t), 68, ly, L.W - 48 - 64, 12, e.kind === 'miss' || e.kind === 'sick' || e.kind === 'sulk' || e.kind === 'corner' ? '#f0a090' : e.kind === 'cover' || e.kind === 'thanks' ? PAL.glow : PAL.cream2);
+  });
+  button('away_ok', L.W / 2 - 60, y + h - 44, 120, 34, closeOver, (x, yy, w, hh) => text('好', x + w / 2, yy + 15, 15, PAL.white, 'center', 800), { col: '#c8664a', shade: '#9e4c36' });
+}
+
+function drawLog() {
+  dim();
+  const lines = S.log.slice(-14);
+  const h = 70 + Math.max(1, lines.length) * 30;
+  const y = Math.max(40, (L.H - h) / 2);
+  panel(16, y, L.W - 32, h, '#33263a', '#241b26');
+  pix.icon(ctx, 'log', 40, y + 24, 20);
+  text('屋里的痕迹', 58, y + 24, 16, PAL.glow, 'left', 800);
+  text('点任意处关', L.W - 34, y + 24, 10, '#a8949c', 'right', 500);
+  lines.forEach((e, i) => {
+    const ly = y + 58 + i * 30;
+    drawBadge(e.who, 40, ly, 20);
+    fitText(sim.line(e, S.t), 58, ly, L.W - 32 - 54, 12, e.kind === 'cover' || e.kind === 'thanks' ? PAL.glow : PAL.cream2);
+  });
+}
+
+function openShare() {
+  sfx.tap();
+  const k = sim.worst(S);
+  const title = config.share.lines[k];
+  platform.share(title, config.share.realShare);
+  G.over = { type: 'share', t: 0, title, tapClose: true };
+}
+
+function drawShare(o) {
+  dim(0.8);
+  const x = 34;
+  const w = L.W - 68;
+  const y = L.H / 2 - 190;
+  text('微信里会发出这样一张卡片', L.W / 2, y - 18, 12, '#a8949c', 'center', 600);
+  // 卡片：白底，上面一行标题，下面一张图
+  ctx.fillStyle = PAL.out;
+  ctx.fillRect(x - 3, y - 3, w + 6, 320 + 6);
+  ctx.fillStyle = '#f6f1ea';
+  ctx.fillRect(x, y, w, 320);
+  drawBadge('me', x + 22, y + 22, 22);
+  text('你', x + 40, y + 22, 12, '#5a4a52', 'left', 600);
+  text(o.title, x + 14, y + 56, 18, '#1f1a22', 'left', 800);
+  // 图：房间缩影
+  const iy = y + 78;
+  ctx.fillStyle = '#3d2f3b';
+  ctx.fillRect(x + 14, iy, w - 28, 170);
+  ctx.fillStyle = '#5a4033';
+  ctx.fillRect(x + 14, iy + 110, w - 28, 60);
+  ctx.fillStyle = 'rgba(255,205,130,0.16)';
+  ctx.beginPath();
+  ctx.ellipse(x + w / 2, iy + 90, 110, 80, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = PAL.mustard;
+  ctx.fillRect(x + w / 2 - 15, iy + 12, 30, 12);
+  ctx.fillStyle = '#fff2c0';
+  ctx.fillRect(x + w / 2 - 6, iy + 24, 12, 6);
+  const sp = pix.petSprite(Object.assign(petPose(), { pose: S.sick || S.asleep ? 'lie' : 'sit', look: 0, flip: false }));
+  pix.blitBottom(ctx, sp, x + w / 2, iy + 150, 3.4);
+  // 痕迹一行
+  const last = S.log[S.log.length - 1];
+  if (last) fitText(sim.line(last, S.t), x + 14, iy + 186, w - 28, 11, '#6a5a62');
+  ctx.fillStyle = '#e2dbd2';
+  ctx.fillRect(x, y + 292, w, 1);
+  text('留灯小屋 · 你、小C、阿树 · 点开就能回来', x + 14, y + 306, 10, '#8a7a82', 'left', 500);
+  text('（原型：只展示，不会真的发出去）', L.W / 2, y + 350, 11, '#a8949c', 'center', 500);
+  text('点任意处关', L.W / 2, y + 370, 10, '#6f5f6a', 'center', 500);
+}
+
+function openFriend(id) {
+  sfx.tap();
+  G.over = { type: 'friend', id, t: 0, tapClose: true };
+}
+
+function drawFriend(o) {
+  dim(0.6);
+  const f = sim.friendCfg(o.id);
+  const c = R.corners[o.id];
+  const w = 230;
+  const x = Math.max(12, Math.min(L.W - w - 12, c.x - w / 2));
+  const y = Math.max(TOP + 10, c.y - 250);
+  panel(x, y, w, 190, '#33263a', '#241b26');
+  const sp = pix.personSprite(o.id, { b: Math.floor(G.t * 1.5) % 2, wave: Math.floor(G.t * 2) % 2 === 0 });
+  pix.blitBottom(ctx, sp, x + 40, y + 112, 3);
+  text(f.name, x + 80, y + 26, 18, PAL.cream2, 'left', 800);
+  text(f.habit + ' · ' + f.shifts.map((s) => s.at).join(' / '), x + 80, y + 48, 11, '#a8949c', 'left', 600);
+  const last = S.last[o.id];
+  text('上次来：' + sim.when(last, S.t), x + 80, y + 68, 11, '#c8b8c0', 'left', 500);
+  if (S.t < S.friends[o.id].tripUntil) text('出远门了', x + 80, y + 88, 11, '#f0a090', 'left', 700);
+  else if (S.missing[o.id]) text('它很想她', x + 80, y + 88, 11, '#f0a090', 'left', 700);
+  button('knock_' + o.id, x + 14, y + 128, 96, 46, () => sendTo(o.id, 'knock'), (bx, by, bw, bh) => {
+    pix.icon(ctx, 'door', bx + 24, by + 21, 24);
+    text('敲门', bx + 64, by + 21, 13, PAL.cream2, 'center', 800);
+  });
+  const sent = S.sentHeart[o.id] === Math.floor(S.t / 1440);
+  button('heart_' + o.id, x + 120, y + 128, 96, 46, () => sendTo(o.id, 'heart'), (bx, by, bw, bh) => {
+    pix.icon(ctx, 'heartSend', bx + 24, by + 21, 24, sent ? 0.4 : 1);
+    text(sent ? '留过了' : '留爱心', bx + 64, by + 21, 13, sent ? '#8a7a82' : PAL.cream2, 'center', 800);
+  }, { col: '#5a3a44', shade: '#3e2630' });
+}
+
+function openFurn() {
+  sfx.tap();
+  G.over = { type: 'furn', t: 0, tapClose: true };
+}
+
+function drawFurn() {
+  dim(0.7);
+  const list = config.furniture.mine.concat([config.furniture.limited]);
+  const y = L.H / 2 - 170;
+  panel(16, y, L.W - 32, 300, '#33263a', '#241b26');
+  text('你的角落放什么', L.W / 2, y + 26, 16, PAL.glow, 'center', 800);
+  text('每人一个角落，一件家具', L.W / 2, y + 46, 10, '#a8949c', 'center', 500);
+  const cw = 100;
+  list.forEach((k, i) => {
+    const col = i % 3;
+    const row = Math.floor(i / 3);
+    const bx = 30 + col * (cw + 8) + (row === 1 ? (cw + 8) / 2 : 0);
+    const by = y + 62 + row * 112;
+    const lim = k === config.furniture.limited;
+    const locked = lim && !S.unlocked[k];
+    const cur = S.furniture.me === k;
+    button('furn_' + k, bx, by, cw, 102, () => {
+      if (locked) watchAd('限定家具 · ' + pix.FURN_NAME[k], () => { S.unlocked[k] = true; placeFurniture(k); });
+      else placeFurniture(k);
+    }, (x, yy, w, h) => {
+      const sp = pix.furnitureSprite(k, Math.floor(G.t * 4) % 8);
+      const px = Math.min(2.6, 70 / Math.max(sp.w, sp.h));
+      pix.blitBottom(ctx, sp, x + w / 2, yy + 70, px);
+      text(pix.FURN_NAME[k], x + w / 2, yy + 84, 12, PAL.cream2, 'center', 700);
+      if (lim) {
+        panel(x + 4, yy + 4, 40, 18, '#c8664a', '#9e4c36');
+        text('限定', x + 24, yy + 12, 10, PAL.white, 'center', 800);
+        if (locked) pix.icon(ctx, 'ad', x + w - 16, yy + 14, 16);
+      }
+    }, { col: cur ? '#6a5040' : '#45354a', shade: cur ? '#4a3428' : '#2e2230' });
+  });
+}
+
+function drawAd(o) {
+  ctx.fillStyle = '#0c0a10';
+  ctx.fillRect(0, 0, L.W, L.H);
+  pix.icon(ctx, 'ad', L.W / 2, L.H / 2 - 60, 56);
+  text('广告占位（激励视频）', L.W / 2, L.H / 2, 17, PAL.cream2, 'center', 800);
+  text('看完：' + o.label, L.W / 2, L.H / 2 + 28, 13, PAL.glow, 'center', 600);
+  const k = Math.min(1, o.t / config.fakeAdSec);
+  ctx.fillStyle = '#2a2230';
+  ctx.fillRect(L.W / 2 - 100, L.H / 2 + 56, 200, 8);
+  ctx.fillStyle = PAL.glow;
+  ctx.fillRect(L.W / 2 - 100, L.H / 2 + 56, 200 * k, 8);
+}
+
+function drawToast() {
+  if (G.toast) {
+    const tt = G.toast;
+    const a = tt.t < 0.15 ? tt.t / 0.15 : tt.t > 1.5 ? (1.8 - tt.t) / 0.3 : 1;
+    ctx.globalAlpha = Math.max(0, a);
+    ctx.font = '700 13px ' + FONT;
+    const w = ctx.measureText(tt.text).width + (tt.icon ? 50 : 30);
+    const y = R.pet.y - 150;
+    panel(L.W / 2 - w / 2, y, w, 32, '#2a2030', '#1c141e');
+    if (tt.icon) pix.icon(ctx, tt.icon, L.W / 2 - w / 2 + 18, y + 14, 16);
+    text(tt.text, L.W / 2 + (tt.icon ? 10 : 0), y + 14, 13, PAL.cream2, 'center', 700);
+    ctx.globalAlpha = 1;
+  }
+  if (G.big) {
+    const b = G.big;
+    const pop = b.t < 0.2 ? 0.6 + (b.t / 0.2) * 0.5 : b.t < 0.3 ? 1.1 - ((b.t - 0.2) / 0.1) * 0.1 : 1;
+    const a = b.t > 1.8 ? (2.2 - b.t) / 0.4 : 1;
+    ctx.globalAlpha = Math.max(0, a);
+    ctx.save();
+    ctx.translate(L.W / 2, R.top + R.RH * 0.36);
+    ctx.scale(pop, pop);
+    ctx.font = '800 20px ' + FONT;
+    const w = ctx.measureText(b.text).width + (b.who ? 70 : 40);
+    panel(-w / 2, -24, w, 48, '#6a4a2a', '#4a321c');
+    if (b.who) drawBadge(b.who, -w / 2 + 26, -2, 26);
+    textOutlined(b.text, b.who ? 16 : 0, -2, 20, PAL.glow);
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+}
+
+// ———— 开场 ————
+function drawTitle() {
+  const t = G.t;
+  ctx.fillStyle = '#120d13';
+  ctx.fillRect(0, 0, L.W, L.H);
+  const fl = 1 + Math.sin(t * 7) * 0.03 + Math.sin(t * 13) * 0.02;
+  const cy = L.H * 0.34;
+  for (const bd of [[240, 0.05], [170, 0.06], [110, 0.08], [60, 0.12]]) {
+    ctx.fillStyle = 'rgba(255,205,130,' + (bd[1] * fl).toFixed(3) + ')';
+    ctx.beginPath();
+    ctx.ellipse(L.W / 2, cy, bd[0], bd[0], 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.fillStyle = '#1f1820';
+  ctx.fillRect(L.W / 2 - 1, 0, 3, cy - 60);
+  for (let j = 0; j < 9; j++) {
+    const hw = 15 + j * 4;
+    ctx.fillStyle = PAL.out;
+    ctx.fillRect(L.W / 2 - hw - 3, cy - 62 + j * 4, hw * 2 + 6, 4);
+    ctx.fillStyle = j > 6 ? PAL.mustardS : PAL.mustard;
+    ctx.fillRect(L.W / 2 - hw, cy - 62 + j * 4, hw * 2, 4);
+  }
+  ctx.fillStyle = '#fff2c0';
+  ctx.fillRect(L.W / 2 - 12, cy - 26, 24, 10);
+  textOutlined('留灯', L.W / 2, cy + 50, 54, PAL.glow);
+  text('给晚回来的人，留一盏灯', L.W / 2, cy + 92, 14, '#c8b8c0', 'center', 600);
+  // 三个人和一只猫
+  const by = L.H * 0.72;
+  const b = Math.floor(t * 1.5) % 2;
+  pix.blitBottom(ctx, pix.personSprite('c', { b }), L.W / 2 - 100, by, 3);
+  pix.blitBottom(ctx, pix.personSprite('me', { b: 1 - b }), L.W / 2, by - 6, 3);
+  pix.blitBottom(ctx, pix.personSprite('s', { b }), L.W / 2 + 100, by, 3);
+  pix.blitBottom(ctx, pix.petSprite({ pose: 'sit', b, eye: Math.floor(t * 10) % 31 === 0 ? 'shut' : 'open', look: 0, tail: Math.floor(t * 4) % 8, dirt: 0 }), L.W / 2 - 46, by + 36, 2.4);
+  text('小C', L.W / 2 - 100, by + 18, 11, '#a8949c');
+  text('你', L.W / 2, by + 12, 11, '#a8949c');
+  text('阿树', L.W / 2 + 100, by + 18, 11, '#a8949c');
+  button('enter', L.W / 2 - 80, L.H * 0.84, 160, 50, enterRoom, (x, y, w, h) => text('进屋', x + w / 2, y + 22, 18, PAL.white, 'center', 800), { col: '#c8664a', shade: '#9e4c36' });
+  text(config.version, L.W / 2, L.H - 18, 10, '#5a4a52');
+}
+
+function enterRoom() {
+  G.mode = 'room';
+  sfx.bell();
+  if (S.firstOpen) {
+    S.firstOpen = false;
+    G.firstRoomHint = 4;
+    toast('三个人一起养它：摸摸它试试');
+  }
+  save();
+}
+
+function draw() {
+  ctx.setTransform(P.dpr * scale, 0, 0, P.dpr * scale, 0, 0);
+  G.buttons = [];
+  if (G.mode === 'title') {
+    drawTitle();
+    return;
+  }
+  ctx.fillStyle = '#1c141e';
+  ctx.fillRect(0, 0, L.W, L.H);
+  drawPetAndRoom();
+  drawParticles();
+  drawBanners();
+  // 底部 UI 背景
+  ctx.fillStyle = '#1c141e';
+  ctx.fillRect(0, R.bottom, L.W, L.H - R.bottom);
+  ctx.fillStyle = PAL.out;
+  ctx.fillRect(0, R.bottom, L.W, 3);
+  drawNeeds();
+  drawActButtons();
+  drawTraceStrip();
+  drawTopBar();
+  drawToast();
+  if (G.flash > 0) {
+    ctx.fillStyle = 'rgba(255,220,150,' + (G.flash * 0.35).toFixed(3) + ')';
+    ctx.fillRect(0, 0, L.W, L.H);
+  }
+  const o = G.over;
+  if (o) {
+    // 弹层盖住下面的按钮
+    G.buttons = [];
+    if (o.type === 'away') drawAway(o);
+    else if (o.type === 'log') drawLog();
+    else if (o.type === 'share') drawShare(o);
+    else if (o.type === 'friend') drawFriend(o);
+    else if (o.type === 'furn') drawFurn();
+    else if (o.type === 'ad') drawAd(o);
+  }
+}
+
+let last = now();
+function frame() {
+  const t = now();
+  const dt = Math.min(0.1, (t - last) / 1000);
+  last = t;
+  if (G.firstRoomHint > 0) G.firstRoomHint -= dt;
+  update(dt);
+  draw();
+  platform.nextFrame(frame);
+}
+
+loadOrNew();
+platform.onHide(() => S && save());
+platform.onShow(() => {
+  if (!S) return;
+  const gone = ((now() - (S.lastReal || now())) / 60000) * config.time.gamePerRealMin;
+  if (gone > 2) catchUp(Math.min(gone, config.time.offlineMaxMin), '你不在的时候');
+  S.lastReal = now();
+});
+platform.exposeForTest('__liudeng', {
+  G, R, UI, L, scale, config, sim,
+  S: () => S,
+  reset() { S = sim.newState(12345); S.lastReal = now(); G.bars = Object.assign({}, S.needs); G.over = null; save(); },
+  fastForward, doAct, enterRoom,
+});
+frame();
+
+});
+__def("js/pix.js", function (module, exports, require) {
+// 8 比特像素 + 赛璐璐（平涂 + 一层硬阴影 + 1 像素深色描边）。所有角色、家具、图标都在这里用代码画。
+// 画法：先在一张小格子（Grid）上点格子，自动描边，再合并成一行行色块画到 canvas 上；画过的形状会缓存。
+
+const OUT = '#1a1218';
+
+const PAL = {
+  out: OUT,
+  cat: '#e8a056', catS: '#b96f3a', stripe: '#c0773e', cream: '#f7e6c4', creamS: '#d8bf98',
+  eye: '#231a22', hi: '#fff4e0', nose: '#a0564a', earIn: '#c98a74', blush: '#d9735e', dirt: '#7a5a3e',
+  skin: '#f1c9a5', skinS: '#d6a27f',
+  wood: '#8a5a3c', woodS: '#6b4430', woodL: '#a7714b',
+  coral: '#e0604e', coralS: '#b44538',
+  mustard: '#d9a441', mustardS: '#a97c2c',
+  teal: '#4f8a84', tealS: '#386660',
+  leaf: '#5f8f5a', leafS: '#466c44',
+  cream2: '#efe2c6', cream2S: '#cdbd9c',
+  glow: '#ffd98a', glowS: '#e8a94c',
+  blue: '#7fb6d6', blueS: '#5a8fb0',
+  ink: '#2a2230', white: '#fbf3e4',
+};
+
+function Grid(w, h) {
+  this.w = w;
+  this.h = h;
+  this.c = new Array(w * h).fill(0);
+}
+Grid.prototype.px = function (x, y, col) {
+  x = Math.round(x);
+  y = Math.round(y);
+  if (x < 0 || y < 0 || x >= this.w || y >= this.h) return;
+  this.c[y * this.w + x] = col;
+};
+Grid.prototype.get = function (x, y) {
+  if (x < 0 || y < 0 || x >= this.w || y >= this.h) return 0;
+  return this.c[y * this.w + x];
+};
+Grid.prototype.rect = function (x, y, w, h, col, shade) {
+  for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) this.px(x + i, y + j, shade && (i >= w - Math.max(1, Math.round(w * 0.3)) || j === h - 1) ? shade : col);
+};
+// 椭圆：右下方一块用阴影色（一层硬阴影）
+Grid.prototype.ell = function (cx, cy, rx, ry, col, shade, cut) {
+  const k = cut == null ? 0.55 : cut;
+  for (let y = Math.floor(cy - ry); y <= Math.ceil(cy + ry); y++) {
+    for (let x = Math.floor(cx - rx); x <= Math.ceil(cx + rx); x++) {
+      const dx = (x + 0.5 - cx) / rx;
+      const dy = (y + 0.5 - cy) / ry;
+      if (dx * dx + dy * dy <= 1) this.px(x, y, shade && dx * 0.55 + dy * 0.9 > k ? shade : col);
+    }
+  }
+};
+Grid.prototype.tri = function (x, y, h, dir, col, inner) {
+  // 尖朝上的三角（耳朵）：第 j 行宽 j+1，dir=1 向右长，-1 向左长
+  for (let j = 0; j < h; j++) for (let i = 0; i <= j; i++) this.px(x + i * dir, y + j, inner && i > 0 && i < j && j > 1 ? inner : col);
+};
+Grid.prototype.line = function (x0, y0, x1, y1, col) {
+  const n = Math.max(Math.abs(x1 - x0), Math.abs(y1 - y0), 1);
+  for (let i = 0; i <= n; i++) this.px(x0 + ((x1 - x0) * i) / n, y0 + ((y1 - y0) * i) / n, col);
+};
+Grid.prototype.mirror = function () {
+  const g = new Grid(this.w, this.h);
+  for (let y = 0; y < this.h; y++) for (let x = 0; x < this.w; x++) g.c[y * this.w + x] = this.c[y * this.w + (this.w - 1 - x)];
+  return g;
+};
+// 自动描边 + 合并成色块
+Grid.prototype.runs = function (outline) {
+  const w = this.w + 2;
+  const h = this.h + 2;
+  const g = new Grid(w, h);
+  for (let y = 0; y < this.h; y++) for (let x = 0; x < this.w; x++) g.c[(y + 1) * w + x + 1] = this.c[y * this.w + x];
+  if (outline !== false) {
+    const add = [];
+    for (let y = 0; y < h; y++)
+      for (let x = 0; x < w; x++) {
+        if (g.c[y * w + x]) continue;
+        if (g.get(x - 1, y) || g.get(x + 1, y) || g.get(x, y - 1) || g.get(x, y + 1)) add.push(y * w + x);
+      }
+    for (const i of add) g.c[i] = OUT;
+  }
+  const out = [];
+  for (let y = 0; y < h; y++) {
+    let x = 0;
+    while (x < w) {
+      const col = g.c[y * w + x];
+      if (!col) { x++; continue; }
+      let n = 1;
+      while (x + n < w && g.c[y * w + x + n] === col) n++;
+      out.push(x - 1, y - 1, n, col);
+      x += n;
+    }
+  }
+  return { runs: out, w: this.w, h: this.h };
+};
+
+const cache = {};
+let cacheSize = 0;
+function cached(key, build) {
+  let r = cache[key];
+  if (!r) {
+    if (cacheSize > 600) {
+      for (const k in cache) delete cache[k];
+      cacheSize = 0;
+    }
+    r = cache[key] = build();
+    cacheSize++;
+  }
+  return r;
+}
+
+// 画色块：(x, y) 是左上角，px 是一格多大
+function blit(ctx, sp, x, y, px, alpha) {
+  const r = sp.runs;
+  const o = 0.35; // 一点点重叠，免得缩放后格子之间露缝
+  if (alpha != null) ctx.globalAlpha = alpha;
+  let last = null;
+  for (let i = 0; i < r.length; i += 4) {
+    if (r[i + 3] !== last) {
+      last = r[i + 3];
+      ctx.fillStyle = last;
+    }
+    ctx.fillRect(x + r[i] * px, y + r[i + 1] * px, r[i + 2] * px + o, px + o);
+  }
+  if (alpha != null) ctx.globalAlpha = 1;
+}
+
+// 底边中点放在 (x, y)
+function blitBottom(ctx, sp, x, y, px, alpha) {
+  blit(ctx, sp, Math.round(x - (sp.w * px) / 2), Math.round(y - sp.h * px), px, alpha);
+}
+
+// ———————————————————— 宠物：橘白小猫「灯芯」 ————————————————————
+// o: { pose: sit|eat|back|lie|walk, b: 呼吸 0/1, eye: open|shut|happy|half, look: -1/0/1, tail: 0~7, dirt: 0~3, blush, frame }
+function petSprite(o) {
+  const key = 'pet|' + [o.pose, o.b, o.eye, o.look, o.tail, o.dirt, o.blush ? 1 : 0, o.frame || 0, o.flip ? 1 : 0].join(',');
+  return cached(key, () => {
+    let g;
+    if (o.pose === 'lie') g = petLie(o);
+    else if (o.pose === 'walk') g = petWalk(o);
+    else g = petSit(o);
+    if (o.flip) g = g.mirror();
+    return g.runs();
+  });
+}
+
+function tailPts(g, x0, y0, dir, ph, len, up) {
+  for (let i = 0; i < len; i++) {
+    const s = Math.sin(ph + i * 0.55) * i * 0.22;
+    const x = x0 + dir * (i * 0.75 + s);
+    const y = y0 - i * up + Math.abs(s) * 0.3;
+    const tip = i >= len - 2;
+    g.rect(Math.round(x), Math.round(y), 2, 2, tip ? PAL.cream : PAL.cat);
+    if (!tip) g.px(Math.round(x) + (dir > 0 ? 1 : 0), Math.round(y) + 1, PAL.catS);
+  }
+}
+
+function dirtSpots(g, n, spots) {
+  for (let i = 0; i < n && i < spots.length; i++) {
+    const s = spots[i];
+    g.px(s[0], s[1], PAL.dirt);
+    g.px(s[0] + 1, s[1], PAL.dirt);
+    g.px(s[0], s[1] + 1, PAL.dirt);
+  }
+}
+
+function eyes(g, x1, x2, y, kind) {
+  for (const x of [x1, x2]) {
+    if (kind === 'open') {
+      g.rect(x, y, 2, 2, PAL.eye);
+      g.px(x, y, PAL.hi);
+    } else if (kind === 'happy') {
+      g.px(x, y + 1, PAL.eye);
+      g.px(x + 1, y, PAL.eye);
+      g.px(x + 2, y + 1, PAL.eye);
+    } else if (kind === 'half') {
+      g.rect(x, y + 1, 2, 1, PAL.eye);
+      g.px(x, y + 1, PAL.hi);
+    } else {
+      g.rect(x, y + 1, 3, 1, PAL.eye);
+    }
+  }
+}
+
+function petSit(o) {
+  const g = new Grid(30, 26);
+  const b = o.pose === 'eat' ? 3 : -o.b;
+  const back = o.pose === 'back';
+  // 尾巴在身后
+  tailPts(g, back ? 10 : 19, 21, back ? -1 : 1, (o.tail / 8) * Math.PI * 2, 9, 1.05);
+  g.ell(14, 18.5, 7.5, 6 + (o.b ? 0.3 : 0), PAL.cat, PAL.catS);
+  if (!back) {
+    g.ell(14, 20, 4, 4.2, PAL.cream, PAL.creamS);
+    g.ell(10.5, 24, 2.2, 1.4, PAL.cream, PAL.creamS);
+    g.ell(17.5, 24, 2.2, 1.4, PAL.cream, PAL.creamS);
+  } else {
+    g.rect(12, 13, 1, 2, PAL.stripe);
+    g.rect(15, 14, 1, 2, PAL.stripe);
+    g.rect(13, 17, 2, 1, PAL.stripe);
+  }
+  const hy = 10 + b;
+  g.tri(7, hy - 7, 4, 1, PAL.cat, back ? PAL.cat : PAL.earIn);
+  g.tri(21, hy - 7, 4, -1, PAL.cat, back ? PAL.cat : PAL.earIn);
+  g.ell(14, hy, 7.6, 6, PAL.cat, PAL.catS);
+  // 额头条纹
+  g.rect(13, hy - 5, 2, 1, PAL.stripe);
+  g.px(12, hy - 4, PAL.stripe);
+  g.px(15, hy - 4, PAL.stripe);
+  if (back) {
+    g.rect(12, hy - 1, 4, 1, PAL.stripe);
+    g.rect(13, hy + 2, 2, 1, PAL.stripe);
+  } else {
+    // 口鼻一圈白
+    g.ell(14, hy + 2.5, 3.2, 2.2, PAL.cream, PAL.creamS, 0.8);
+    g.px(7, hy + 1, PAL.stripe);
+    g.px(21, hy + 1, PAL.stripe);
+    const lx = o.look || 0;
+    eyes(g, 10 + lx, 16 + lx, hy - 1, o.eye);
+    g.rect(13, hy + 1, 2, 1, PAL.nose);
+    g.px(12, hy + 3, PAL.eye);
+    g.px(15, hy + 3, PAL.eye);
+    if (o.pose === 'eat') g.rect(13, hy + 3, 2, 1, PAL.nose);
+    if (o.blush) {
+      g.rect(8, hy + 2, 2, 1, PAL.blush);
+      g.rect(19, hy + 2, 2, 1, PAL.blush);
+    }
+  }
+  dirtSpots(g, o.dirt, [[9, 16], [17, 19], [12, 22], [19, 15], [8, hy - 2]]);
+  return g;
+}
+
+function petLie(o) {
+  const g = new Grid(34, 16);
+  // 尾巴绕到身前
+  for (let i = 0; i < 11; i++) {
+    const x = 28 - i * 1.4;
+    const y = 12 + Math.sin(i * 0.35) * 1.5 + (i > 8 ? -((o.tail % 4) * 0.25) : 0);
+    g.rect(Math.round(x), Math.round(y), 2, 2, i > 8 ? PAL.cream : PAL.cat);
+  }
+  g.ell(19, 9.5 - o.b * 0.4, 11, 5 + o.b * 0.4, PAL.cat, PAL.catS);
+  g.rect(16, 5, 1, 2, PAL.stripe);
+  g.rect(20, 5, 1, 2, PAL.stripe);
+  g.rect(24, 6, 1, 2, PAL.stripe);
+  const hx = 8;
+  const hy = 9;
+  g.tri(3, hy - 7, 4, 1, PAL.cat, PAL.earIn);
+  g.tri(13, hy - 7, 4, -1, PAL.cat, PAL.earIn);
+  g.ell(hx, hy, 6.2, 5, PAL.cat, PAL.catS);
+  g.ell(hx, hy + 2.3, 2.8, 1.8, PAL.cream, null);
+  g.rect(hx - 1, hy - 4, 2, 1, PAL.stripe);
+  eyes(g, hx - 4, hx + 2, hy - 1, o.eye);
+  g.rect(hx - 1, hy + 1, 2, 1, PAL.nose);
+  if (o.blush) {
+    g.rect(hx - 5, hy + 2, 2, 1, PAL.blush);
+    g.rect(hx + 4, hy + 2, 2, 1, PAL.blush);
+  }
+  g.ell(14, 13.5, 2.4, 1.3, PAL.cream, PAL.creamS);
+  dirtSpots(g, o.dirt, [[17, 7], [23, 10], [13, 10], [26, 8]]);
+  return g;
+}
+
+function petWalk(o) {
+  const g = new Grid(32, 24);
+  const f = o.frame || 0;
+  tailPts(g, 25, 14, 1, (o.tail / 8) * Math.PI * 2, 8, 1.1);
+  // 四条腿交替
+  const legs = [[9, f ? 0 : 1], [12, f ? 1 : 0], [20, f ? 1 : 0], [23, f ? 0 : 1]];
+  for (const l of legs) {
+    g.rect(l[0], 17, 2, 3 + l[1], l[1] ? PAL.cat : PAL.catS);
+    g.rect(l[0], 20 + l[1], 2, 1, PAL.cream);
+  }
+  g.ell(17, 14 - o.b * 0.3, 9.5, 5, PAL.cat, PAL.catS);
+  g.ell(16, 16.5, 5, 2, PAL.cream, null);
+  g.rect(17, 10, 1, 2, PAL.stripe);
+  g.rect(21, 10, 1, 2, PAL.stripe);
+  const hy = 9 - f * 0.5;
+  g.tri(2, hy - 7, 4, 1, PAL.cat, PAL.earIn);
+  g.tri(11, hy - 7, 4, -1, PAL.cat, PAL.earIn);
+  g.ell(7, hy, 6, 5, PAL.cat, PAL.catS);
+  g.ell(4.5, hy + 2.2, 2.8, 1.8, PAL.cream, null);
+  g.rect(6, hy - 4, 2, 1, PAL.stripe);
+  if (o.eye === 'open') {
+    g.rect(4, hy - 1, 2, 2, PAL.eye);
+    g.px(4, hy - 1, PAL.hi);
+  } else g.rect(4, hy, 2, 1, PAL.eye);
+  g.px(1, hy + 1, PAL.nose);
+  dirtSpots(g, o.dirt, [[14, 12], [22, 14], [10, 15]]);
+  return g;
+}
+
+// ———————————————————— 人：小C / 阿树 / 你 ————————————————————
+const PEOPLE = {
+  c: { hair: '#3b3040', hairS: '#2a2230', coat: '#76874f', coatS: '#5a6a3b', pants: '#3a3346', shoe: '#e8e0d0', style: 'bob', glasses: true },
+  s: { hair: '#6b4a36', hairS: '#523726', coat: '#557aa6', coatS: '#3f5d84', pants: '#c8b48e', shoe: '#5a3e2e', style: 'beanie', hat: PAL.mustard, hatS: PAL.mustardS },
+  me: { hair: '#7a4a36', hairS: '#5c3626', coat: '#c8664a', coatS: '#9e4c36', pants: '#4a3c4c', shoe: '#efe2c6', style: 'bun' },
+};
+
+// o: { b: 呼吸, wave: 挥手, blink, rows: 只画上面几行（头像） }
+function personGrid(id, o) {
+  const P = PEOPLE[id];
+  const g = new Grid(18, o.rows || 32);
+  const b = o.b || 0;
+  const y0 = 3 - b;
+  // 后面的头发
+  if (P.style === 'bob') {
+    g.ell(9, y0 + 6, 6, 6.2, P.hair, P.hairS);
+    g.rect(3, y0 + 6, 12, 5, P.hair, P.hairS);
+  } else if (P.style === 'bun') {
+    g.ell(9, y0 + 0.5, 2.6, 2.4, P.hair, P.hairS);
+    g.ell(9, y0 + 6, 5.6, 5.8, P.hair, P.hairS);
+  } else g.ell(9, y0 + 6.5, 5.4, 5.4, P.hair, P.hairS);
+  // 脸
+  g.ell(9, y0 + 7.5, 4.3, 4.6, PAL.skin, PAL.skinS, 0.9);
+  // 刘海 / 帽子
+  if (P.style === 'bob') {
+    g.rect(4, y0 + 2, 10, 3, P.hair);
+    g.px(6, y0 + 5, P.hair);
+    g.px(12, y0 + 5, P.hair);
+  } else if (P.style === 'beanie') {
+    g.ell(9, y0 + 3.4, 5.6, 4, P.hat, P.hatS);
+    g.rect(3, y0 + 4, 12, 2, P.hatS);
+    g.rect(8, y0 - 1, 2, 1, P.hat);
+    g.px(4, y0 + 7, P.hair);
+    g.px(13, y0 + 7, P.hair);
+  } else {
+    g.rect(5, y0 + 2, 8, 2, P.hair);
+    g.px(5, y0 + 4, P.hair);
+    g.px(12, y0 + 4, P.hair);
+  }
+  // 眼睛
+  const ey = y0 + 7;
+  if (o.blink) {
+    g.rect(6, ey + 1, 2, 1, PAL.eye);
+    g.rect(11, ey + 1, 2, 1, PAL.eye);
+  } else {
+    g.rect(6, ey, 2, 2, PAL.eye);
+    g.rect(11, ey, 2, 2, PAL.eye);
+    g.px(6, ey, PAL.hi);
+    g.px(11, ey, PAL.hi);
+  }
+  if (P.glasses) {
+    g.rect(5, ey - 1, 4, 1, '#4a3a40');
+    g.rect(10, ey - 1, 4, 1, '#4a3a40');
+    g.px(9, ey, '#4a3a40');
+  }
+  g.rect(8, y0 + 10, 2, 1, '#b8655a');
+  if (id === 'me') {
+    g.px(5, y0 + 9, PAL.blush);
+    g.px(13, y0 + 9, PAL.blush);
+  }
+  // 身体
+  const by = y0 + 12;
+  g.rect(8, by, 2, 1, PAL.skinS);
+  g.rect(4, by + 1, 10, 10, P.coat, P.coatS);
+  if (id === 's') g.rect(8, by + 1, 2, 5, PAL.white);
+  if (id === 'c') g.rect(7, by + 1, 4, 2, PAL.cream);
+  if (id === 'me') g.rect(4, by + 1, 10, 2, P.coatS);
+  // 手臂
+  if (o.wave) {
+    g.rect(14, by - 3, 2, 5, P.coat);
+    g.rect(14, by - 5, 2, 2, PAL.skin);
+  } else {
+    g.rect(14, by + 2, 2, 8, P.coatS);
+    g.rect(14, by + 10, 2, 1, PAL.skin);
+  }
+  g.rect(2, by + 2, 2, 8, P.coat);
+  g.rect(2, by + 10, 2, 1, PAL.skin);
+  // 腿
+  g.rect(5, by + 11, 3, 5, P.pants);
+  g.rect(10, by + 11, 3, 5, P.pants);
+  g.rect(4, by + 16, 4, 2, P.shoe);
+  g.rect(10, by + 16, 4, 2, P.shoe);
+  return g;
+}
+
+function personSprite(id, o) {
+  o = o || {};
+  const key = 'p|' + id + '|' + (o.b || 0) + (o.wave ? 1 : 0) + (o.blink ? 1 : 0) + '|' + (o.rows || 0);
+  return cached(key, () => personGrid(id, o).runs());
+}
+
+// 头像：只画头和肩膀，放在 (cx, cy) 为中心、size 见方
+function avatar(ctx, id, cx, cy, size, o) {
+  o = o || {};
+  if (id === 'pet') {
+    const sp = petSprite({ pose: 'sit', b: 0, eye: o.blink ? 'shut' : 'open', look: 0, tail: 2, dirt: 0 });
+    const px = size / 22;
+    // 只要头
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(cx - size / 2, cy - size / 2, size, size);
+    ctx.clip();
+    blit(ctx, sp, cx - 15 * px, cy - size / 2 - 1 * px, px);
+    ctx.restore();
+    return;
+  }
+  const sp = personSprite(id, { rows: 17, blink: o.blink });
+  const px = size / 18;
+  blit(ctx, sp, cx - (sp.w * px) / 2, cy - size / 2 - px, px);
+}
+
+// ———————————————————— 家具 ————————————————————
+// t：动画时间（秒）
+function furnitureSprite(kind, f) {
+  return cached('f|' + kind + '|' + f, () => {
+    let g;
+    if (kind === 'record') {
+      g = new Grid(22, 20);
+      g.rect(1, 9, 20, 10, PAL.wood, PAL.woodS);
+      g.rect(2, 11, 8, 6, PAL.woodS);
+      g.rect(12, 11, 8, 6, PAL.woodS);
+      g.px(9, 14, PAL.mustard);
+      g.px(12, 14, PAL.mustard);
+      g.rect(2, 6, 18, 3, '#3a3036', '#2a2228');
+      g.ell(9, 5.5, 6, 2.6, '#2a2228', null);
+      g.ell(9, 5.5, 1.6, 1, PAL.coral, null);
+      // 唱片转：标签上一点白跟着转
+      const a = (f / 4) * Math.PI * 2;
+      g.px(9 + Math.round(Math.cos(a) * 4), 5 + Math.round(Math.sin(a) * 1.5), '#6a5a62');
+      g.line(17, 3, 14, 6, '#c9c0b0');
+      g.rect(16, 2, 2, 2, '#c9c0b0');
+      // 斜靠的唱片套
+      g.rect(0, 0, 1, 0, PAL.teal);
+    } else if (kind === 'plant') {
+      g = new Grid(22, 30);
+      const sw = f % 2;
+      g.rect(6, 22, 10, 7, '#b9643f', '#8f4a2e');
+      g.rect(5, 21, 12, 2, '#cf774f');
+      g.line(11, 21, 11, 12, PAL.leafS);
+      g.line(11, 18, 5 + sw, 12, PAL.leafS);
+      g.line(11, 16, 17 - sw, 9, PAL.leafS);
+      g.ell(5 + sw, 11, 4.5, 3.5, PAL.leaf, PAL.leafS);
+      g.ell(16 - sw, 8, 5, 4, PAL.leaf, PAL.leafS);
+      g.ell(10 + sw, 4.5, 4, 4, PAL.leaf, PAL.leafS);
+      g.ell(15, 15, 3.6, 2.6, PAL.leaf, PAL.leafS);
+      // 龟背竹的洞
+      g.px(4 + sw, 10, 0);
+      g.px(16 - sw, 7, 0);
+      g.px(18 - sw, 9, 0);
+      g.px(10 + sw, 3, 0);
+    } else if (kind === 'beanbag') {
+      g = new Grid(24, 16);
+      g.ell(12, 10, 11, 6, PAL.mustard, PAL.mustardS);
+      g.ell(10, 7, 6, 3, '#e6b860', null);
+      g.line(8, 12, 16, 12, PAL.mustardS);
+    } else if (kind === 'shelf') {
+      g = new Grid(20, 26);
+      g.rect(1, 1, 18, 24, PAL.wood, PAL.woodS);
+      g.rect(3, 3, 14, 9, '#4a3330');
+      g.rect(3, 14, 14, 9, '#4a3330');
+      const books = ['#c8664a', '#4f8a84', '#d9a441', '#efe2c6', '#5b7fb0', '#7f9a5a'];
+      for (let i = 0; i < 6; i++) g.rect(3 + i * 2 + (i > 3 ? 1 : 0), 5 + (i % 2), 2, 7 - (i % 2), books[i]);
+      for (let i = 0; i < 4; i++) g.rect(4 + i * 3, 16 + (i % 3), 2, 7 - (i % 3), books[(i + 3) % 6]);
+      g.ell(15, 20, 1.6, 2.4, PAL.leaf, null);
+    } else if (kind === 'tank') {
+      g = new Grid(22, 22);
+      g.rect(1, 18, 20, 3, PAL.wood, PAL.woodS);
+      g.rect(2, 4, 18, 14, '#5f9aa0', '#4d8288');
+      g.rect(2, 4, 18, 2, '#86c0c2');
+      g.rect(3, 15, 16, 2, '#c9b48a');
+      g.line(5, 15, 5, 10, PAL.leaf);
+      g.line(6, 15, 7, 11, PAL.leafS);
+      const fx = 8 + ((f * 2) % 10);
+      g.rect(fx, 10, 3, 2, PAL.coral);
+      g.px(fx + ((f >> 2) % 2 ? 3 : -1), 10, PAL.coralS);
+      g.px(14 - (f % 6), 7 + ((f >> 1) % 3), '#d9f0ee');
+      g.px(15, 12 - (f % 5), '#d9f0ee');
+    } else if (kind === 'yarn') {
+      g = new Grid(20, 14);
+      g.rect(2, 7, 16, 6, PAL.wood, PAL.woodS);
+      g.line(2, 9, 17, 9, PAL.woodL);
+      g.ell(7, 6, 4, 3.5, PAL.coral, PAL.coralS);
+      g.ell(13, 6, 3.5, 3.2, PAL.teal, PAL.tealS);
+      g.line(5, 5, 9, 7, '#f08a76');
+      g.line(12, 4, 15, 7, '#6fb0a8');
+      g.line(16, 6, 19, 11, PAL.teal);
+    } else if (kind === 'tent') {
+      g = new Grid(26, 28);
+      for (let j = 0; j < 22; j++) {
+        const hw = Math.round(j * 0.55);
+        for (let i = -hw; i <= hw; i++) g.px(13 + i, 5 + j, i > hw * 0.3 ? PAL.cream2S : (i + 30) % 5 === 0 ? PAL.coral : PAL.cream2);
+      }
+      for (let j = 10; j < 22; j++) {
+        const hw = Math.round((j - 10) * 0.35);
+        for (let i = -hw; i <= hw; i++) g.px(13 + i, 5 + j, '#3a2a30');
+      }
+      g.line(11, 2, 13, 6, PAL.wood);
+      g.line(15, 2, 13, 6, PAL.wood);
+      // 星星串灯
+      for (let i = 0; i < 6; i++) {
+        const x = 3 + i * 4;
+        const y = 8 + Math.round(Math.abs(i - 2.5) * -1 + 3);
+        g.px(x, y, (i + f) % 3 === 0 ? '#fff2b0' : PAL.glow);
+      }
+    } else {
+      g = new Grid(4, 4);
+    }
+    return g.runs();
+  });
+}
+
+const FURN_NAME = { record: '唱片机', plant: '龟背竹', beanbag: '懒人沙发', shelf: '小书架', tank: '小鱼缸', yarn: '毛线篮', tent: '星星帐篷' };
+
+// ———————————————————— 图标 ————————————————————
+function iconGrid(name) {
+  const g = new Grid(14, 14);
+  switch (name) {
+    case 'food':
+      g.ell(7, 6.5, 4.5, 1.8, '#b98a5a', null);
+      g.px(5, 5, PAL.coral); g.px(7, 5, '#c98a4a'); g.px(9, 6, PAL.coral); g.px(6, 6, '#c98a4a');
+      for (let j = 0; j < 5; j++) g.rect(1 + j * 0.5, 7 + j, 12 - j, 1, j > 2 ? PAL.coralS : PAL.coral);
+      g.rect(2, 8, 10, 1, '#f08a76');
+      break;
+    case 'rest':
+      g.ell(7, 7, 5.5, 5.5, PAL.glow, PAL.glowS);
+      g.ell(9.5, 5.5, 4.5, 4.5, 0, null);
+      g.px(11, 2, PAL.white); g.px(12, 9, PAL.white);
+      break;
+    case 'love':
+      g.ell(4.5, 5, 3.2, 3, PAL.coral, PAL.coralS);
+      g.ell(9.5, 5, 3.2, 3, PAL.coral, PAL.coralS);
+      for (let j = 0; j < 6; j++) g.rect(1.5 + j, 6 + j, 11 - j * 2, 1, j > 2 ? PAL.coralS : PAL.coral);
+      g.px(3, 4, '#f6a090');
+      break;
+    case 'clean':
+      for (let j = 0; j < 11; j++) {
+        const w = j < 4 ? j * 0.6 : Math.min(4.5, 1.5 + (j - 3) * 0.8) - (j > 9 ? (j - 9) * 1.5 : 0);
+        for (let i = -Math.round(w); i <= Math.round(w); i++) g.px(7 + i, 1 + j, i > 0 && j > 5 ? PAL.blueS : PAL.blue);
+      }
+      g.px(5, 7, PAL.white); g.px(5, 8, PAL.white);
+      break;
+    case 'hand':
+      g.rect(3, 6, 8, 6, PAL.skin, PAL.skinS);
+      for (let i = 0; i < 4; i++) g.rect(3 + i * 2, 2 + (i === 0 || i === 3 ? 1 : 0), 2, 5, PAL.skin);
+      g.rect(10, 6, 3, 2, PAL.skin);
+      g.line(5, 3, 5, 6, PAL.skinS); g.line(7, 2, 7, 6, PAL.skinS); g.line(9, 3, 9, 6, PAL.skinS);
+      break;
+    case 'blanket':
+      g.rect(1, 3, 12, 9, PAL.teal, PAL.tealS);
+      for (let j = 0; j < 9; j += 3) for (let i = (j / 3) % 2 ? 0 : 3; i < 12; i += 6) g.rect(1 + i, 3 + j, 3, 3, '#6fa8a0');
+      g.rect(1, 3, 12, 2, PAL.cream2);
+      break;
+    case 'sponge':
+      g.rect(2, 5, 10, 7, '#f0c95a', '#c9a03c');
+      g.px(4, 7, '#c9a03c'); g.px(8, 9, '#c9a03c'); g.px(6, 10, '#c9a03c');
+      g.ell(4, 3, 1.8, 1.8, '#dff1f7', null); g.ell(9, 2, 1.3, 1.3, '#dff1f7', null); g.ell(11.5, 4, 1, 1, '#dff1f7', null);
+      break;
+    case 'energy':
+      for (let j = 0; j < 11; j++) {
+        const w = j < 5 ? j * 0.55 : 3 - (j - 5) * 0.2;
+        for (let i = -Math.round(w); i <= Math.round(w); i++) g.px(7 + i, 1 + j, j > 6 ? PAL.glowS : i < 1 && j > 3 ? '#fff2b0' : PAL.glow);
+      }
+      break;
+    case 'ff':
+      for (let j = 0; j < 9; j++) { const w = 4 - Math.abs(j - 4); g.rect(2, 2 + j, w + 1, 1, PAL.cream2); g.rect(7, 2 + j, w + 1, 1, PAL.cream2); }
+      break;
+    case 'share':
+      for (let j = 0; j < 10; j++) g.rect(1 + j, 6 - Math.floor(j / 2), 1, 1 + j - Math.floor(j / 2), PAL.white);
+      g.line(1, 6, 12, 1, PAL.white); g.line(12, 1, 8, 12, PAL.cream2S); g.line(5, 8, 12, 1, PAL.blueS);
+      g.rect(5, 8, 2, 3, PAL.cream2S);
+      break;
+    case 'log':
+      g.rect(2, 1, 10, 12, PAL.cream2, PAL.cream2S);
+      g.rect(2, 1, 2, 12, PAL.coral);
+      g.line(5, 4, 10, 4, PAL.ink); g.line(5, 7, 10, 7, PAL.ink); g.line(5, 10, 8, 10, PAL.ink);
+      break;
+    case 'ad':
+      g.rect(1, 2, 12, 9, PAL.ink, '#1f1a24');
+      g.rect(2, 3, 10, 7, '#4a5a7a');
+      for (let j = 0; j < 5; j++) g.rect(5, 4 + j, 3 - Math.abs(j - 2), 1, PAL.glow);
+      g.rect(4, 11, 6, 1, PAL.ink);
+      break;
+    case 'doctor':
+      g.rect(1, 4, 12, 9, PAL.white, PAL.cream2S);
+      g.rect(4, 2, 6, 2, PAL.cream2S);
+      g.rect(6, 6, 2, 6, PAL.coral); g.rect(4, 8, 6, 2, PAL.coral);
+      break;
+    case 'door':
+      g.rect(2, 1, 10, 12, PAL.wood, PAL.woodS);
+      g.rect(4, 3, 6, 4, PAL.woodL); g.rect(4, 8, 6, 3, PAL.woodL);
+      g.px(10, 8, PAL.glow);
+      break;
+    case 'heartSend':
+      g.ell(4, 6, 2.8, 2.6, PAL.coral, PAL.coralS);
+      g.ell(8.5, 6, 2.8, 2.6, PAL.coral, PAL.coralS);
+      for (let j = 0; j < 5; j++) g.rect(1.5 + j, 7 + j, 10 - j * 2, 1, PAL.coral);
+      g.px(12, 1, PAL.glow); g.px(11, 2, PAL.glow); g.px(13, 2, PAL.glow); g.px(12, 3, PAL.glow);
+      break;
+    case 'sofa':
+      g.ell(7, 8, 6, 4, PAL.mustard, PAL.mustardS);
+      break;
+    case 'sick':
+      g.rect(5, 1, 3, 10, PAL.white, PAL.cream2S);
+      g.rect(5, 8, 3, 4, PAL.coral);
+      g.ell(6.5, 11.5, 2.2, 2, PAL.coral, PAL.coralS);
+      break;
+    default:
+      g.rect(3, 3, 8, 8, PAL.white);
+  }
+  return g;
+}
+
+function icon(ctx, name, cx, cy, size, alpha) {
+  const sp = cached('i|' + name, () => iconGrid(name).runs());
+  const px = size / 14;
+  blit(ctx, sp, cx - (sp.w * px) / 2, cy - (sp.h * px) / 2, px, alpha);
+}
+
+module.exports = { PAL, OUT, Grid, blit, blitBottom, cached, petSprite, personSprite, avatar, furnitureSprite, icon, FURN_NAME, PEOPLE };
+
+});
+__def("js/platform.js", function (module, exports, require) {
+// 平台层：只有这个文件知道自己跑在微信里还是浏览器里。
+// 微信小游戏：wx.createCanvas / wx.onTouchStart / wx.createRewardedVideoAd
+// 浏览器预览：一张 <canvas id="game">，用 pointer 事件（只用一种事件，免得一次点击被算两次）
+const isWx = typeof wx !== 'undefined' && wx && typeof wx.createCanvas === 'function';
+
+function setup(onTouch) {
+  let canvas, width, height, dpr;
+  if (isWx) {
+    canvas = wx.createCanvas();
+    const info = (wx.getWindowInfo && wx.getWindowInfo()) || wx.getSystemInfoSync();
+    width = info.windowWidth;
+    height = info.windowHeight;
+    dpr = info.pixelRatio || 2;
+    canvas.width = Math.round(width * dpr);
+    canvas.height = Math.round(height * dpr);
+    const send = (type) => (e) => {
+      const list = e.changedTouches || [];
+      for (let i = 0; i < list.length; i++) {
+        onTouch(type, list[i].identifier, list[i].clientX, list[i].clientY);
+      }
+    };
+    wx.onTouchStart((e) => { unlockAudio(); send('down')(e); });
+    wx.onTouchMove(send('move'));
+    wx.onTouchEnd(send('up'));
+    wx.onTouchCancel(send('up'));
+  } else {
+    canvas = document.getElementById('game');
+    // 电脑上预览时装成一部手机大小；手机浏览器里就占满屏
+    const phone = window.innerWidth > 520;
+    width = phone ? 390 : window.innerWidth;
+    height = phone ? Math.min(844, window.innerHeight - 20) : window.innerHeight;
+    dpr = window.devicePixelRatio || 2;
+    canvas.style.width = width + 'px';
+    canvas.style.height = height + 'px';
+    canvas.width = Math.round(width * dpr);
+    canvas.height = Math.round(height * dpr);
+    const pos = (e) => {
+      const r = canvas.getBoundingClientRect();
+      return [e.clientX - r.left, e.clientY - r.top];
+    };
+    canvas.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+      unlockAudio();
+      const p = pos(e);
+      onTouch('down', e.pointerId, p[0], p[1]);
+    });
+    canvas.addEventListener('pointermove', (e) => {
+      const p = pos(e);
+      onTouch('move', e.pointerId, p[0], p[1]);
+    });
+    const up = (e) => {
+      const p = pos(e);
+      onTouch('up', e.pointerId, p[0], p[1]);
+    };
+    canvas.addEventListener('pointerup', up);
+    canvas.addEventListener('pointercancel', up);
+  }
+  return { canvas, ctx: canvas.getContext('2d'), width, height, dpr };
+}
+
+function now() {
+  return Date.now();
+}
+
+function nextFrame(fn) {
+  return requestAnimationFrame(fn);
+}
+
+function vibrate(strong) {
+  if (isWx && wx.vibrateShort) {
+    wx.vibrateShort({ type: strong ? 'heavy' : 'light', fail() {} });
+  } else if (typeof navigator !== 'undefined' && navigator.vibrate) {
+    navigator.vibrate(strong ? 30 : 10);
+  }
+}
+
+// 激励视频。填了广告位 id 且在微信里才放真广告，返回 true；
+// 否则返回 false，由游戏自己放「广告占位」倒计时。
+let rewardedAd = null;
+function showRewardedAd(adUnitId, onReward, onSkip) {
+  onSkip = onSkip || function () {};
+  if (!isWx || !adUnitId || !wx.createRewardedVideoAd) return false;
+  if (!rewardedAd) rewardedAd = wx.createRewardedVideoAd({ adUnitId });
+  rewardedAd.offClose();
+  rewardedAd.onClose((res) => {
+    // 旧版基础库 res 为 undefined，算看完
+    if (!res || res.isEnded) onReward();
+    else onSkip();
+  });
+  rewardedAd.show().catch(() => {
+    rewardedAd.load().then(() => rewardedAd.show()).catch(() => onReward());
+  });
+  return true;
+}
+
+// 存档：微信用 wx.setStorageSync，浏览器用 localStorage
+function load(key) {
+  try {
+    const raw = isWx ? wx.getStorageSync(key) : window.localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function save(key, value) {
+  try {
+    const raw = JSON.stringify(value);
+    if (isWx) wx.setStorageSync(key, raw);
+    else window.localStorage.setItem(key, raw);
+  } catch (e) {
+    // 存不了就算了：原型里不影响玩
+  }
+}
+
+function exposeForTest(name, value) {
+  if (!isWx && typeof window !== 'undefined') window[name] = value;
+}
+
+// —— 声音：WebAudio 现场合成（微信用 wx.createWebAudioContext，浏览器用 AudioContext）——
+let actx = null;
+let noiseBuf = null;
+let muted = false;
+function audio() {
+  if (actx) return actx;
+  try {
+    if (isWx) {
+      if (wx.createWebAudioContext) actx = wx.createWebAudioContext();
+    } else if (typeof window !== 'undefined') {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) actx = new AC();
+    }
+  } catch (e) {
+    actx = null;
+  }
+  return actx;
+}
+function unlockAudio() {
+  const a = audio();
+  if (a && a.state === 'suspended' && a.resume) a.resume();
+}
+// 一个音：freq 起始频率，to 结束频率，dur 秒，type 波形，vol 音量，delay 延后几秒
+function tone(o) {
+  const a = audio();
+  if (!a || muted) return;
+  try {
+    const t0 = a.currentTime + (o.delay || 0);
+    const dur = o.dur || 0.12;
+    const g = a.createGain();
+    const vol = (o.vol == null ? 0.2 : o.vol) * 0.6;
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.linearRampToValueAtTime(vol, t0 + Math.min(0.02, dur / 4) + (o.attack || 0));
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    g.connect(a.destination);
+    let src;
+    if (o.noise) {
+      if (!noiseBuf) {
+        noiseBuf = a.createBuffer(1, Math.floor(a.sampleRate * 0.6), a.sampleRate);
+        const d = noiseBuf.getChannelData(0);
+        for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+      }
+      src = a.createBufferSource();
+      src.buffer = noiseBuf;
+      const f = a.createBiquadFilter();
+      f.type = o.filter || 'lowpass';
+      f.frequency.setValueAtTime(o.freq || 800, t0);
+      if (o.to) f.frequency.exponentialRampToValueAtTime(o.to, t0 + dur);
+      src.connect(f);
+      f.connect(g);
+    } else {
+      src = a.createOscillator();
+      src.type = o.type || 'square';
+      src.frequency.setValueAtTime(o.freq, t0);
+      if (o.to) src.frequency.exponentialRampToValueAtTime(o.to, t0 + dur);
+      src.connect(g);
+    }
+    src.start(t0);
+    src.stop(t0 + dur + 0.02);
+  } catch (e) {
+    // 没声音也能玩
+  }
+}
+
+// 分享卡：原型里默认只展示；enabled=true 且在微信里才真的调起分享
+function share(title, enabled) {
+  if (isWx && enabled && wx.shareAppMessage) {
+    wx.shareAppMessage({ title });
+    return true;
+  }
+  return false;
+}
+
+// 切回前台（关掉再打开、切 App 回来）：补算不在的时间
+function onShow(fn) {
+  if (isWx) {
+    if (wx.onShow) wx.onShow(() => fn());
+  } else if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) fn();
+    });
+  }
+}
+function onHide(fn) {
+  if (isWx) {
+    if (wx.onHide) wx.onHide(() => fn());
+  } else if (typeof window !== 'undefined') {
+    window.addEventListener('pagehide', () => fn());
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) fn();
+    });
+  }
+}
+
+module.exports = { isWx, setup, now, nextFrame, vibrate, showRewardedAd, load, save, exposeForTest, tone, share, onShow, onHide };
+
+});
+__def("js/room.js", function (module, exports, require) {
+// 房间：墙、窗（跟着游戏里的钟变天色）、地板、吊灯（会闪）、三个人的角落。
+// 只画「不怎么动的背景」和家具；宠物、人、特效在 main.js 里画在上面。
+const pix = require('./pix.js');
+const { PAL } = pix;
+
+const PX = 3; // 房间里一个像素格 = 3 点
+
+function snap(v) {
+  return Math.round(v / PX) * PX;
+}
+
+// 根据屏幕高度摆房间：返回各处的位置
+function layout(W, top, bottom) {
+  const RH = bottom - top;
+  const floorY = snap(top + RH * 0.5);
+  const R = {
+    W, top, bottom, RH, floorY,
+    win: { x: 141, y: snap(top + 20), w: 93, h: snap(Math.min(126, RH * 0.24)) },
+    door: { x: 66, y: floorY - 114, w: 48, h: 114 },
+    lamp: { x: 186, y: snap(top + RH * 0.3) },
+    pet: { x: 187, y: snap(floorY + (bottom - floorY) * 0.6) },
+    bowl: { x: 118, y: snap(floorY + (bottom - floorY) * 0.78) },
+  };
+  const cy = snap(floorY + (bottom - floorY) * 0.36);
+  R.corners = {
+    c: { x: 58, y: cy, petX: 118, mat: '#56653d' },
+    s: { x: 318, y: cy, petX: 256, mat: '#3f5878' },
+    me: { x: 187, y: floorY + 12, petX: 187, mat: '#8f4e3a' },
+  };
+  return R;
+}
+
+// 天色：按小时给窗外三层颜色
+function sky(hour) {
+  if (hour < 5 || hour >= 21) return ['#141a33', '#1b2443', '#243058', 'night'];
+  if (hour < 7) return ['#2b2c55', '#7a5a7a', '#d7906e', 'dawn'];
+  if (hour < 17) return ['#7fb0c8', '#9cc4d4', '#c4dcdc', 'day'];
+  if (hour < 19) return ['#4a4f7a', '#c4746a', '#f0b070', 'dusk'];
+  return ['#1d2142', '#2f3360', '#55507a', 'night'];
+}
+
+// 灯在闪：几个正弦叠加，偶尔暗一下
+function flicker(t) {
+  const n = Math.sin(t * 7.1) * 0.02 + Math.sin(t * 13.7) * 0.015 + Math.sin(t * 2.3) * 0.02;
+  const dip = Math.sin(t * 0.9) > 0.985 ? -0.12 : 0;
+  return 1 + n + dip;
+}
+
+function darkness(hour) {
+  // 0 = 白天，1 = 深夜
+  if (hour >= 7 && hour < 17) return 0.15;
+  if (hour >= 17 && hour < 19) return 0.15 + ((hour - 17) / 2) * 0.6;
+  if (hour >= 5 && hour < 7) return 0.75 - ((hour - 5) / 2) * 0.6;
+  return 0.75 + (hour >= 21 || hour < 3 ? 0.25 : 0.1);
+}
+
+function rect(ctx, x, y, w, h, col) {
+  ctx.fillStyle = col;
+  ctx.fillRect(x, y, w, h);
+}
+
+function drawRoom(ctx, R, o) {
+  const { t, hour, lampBoost } = o;
+  const W = R.W;
+  const fl = flicker(t) + (lampBoost || 0);
+  const dark = darkness(hour);
+
+  // 墙
+  rect(ctx, 0, R.top, W, R.floorY - R.top, '#3d2f3b');
+  for (let x = 0; x < W; x += 15) rect(ctx, x, R.top, PX, R.floorY - R.top, '#392b37');
+  rect(ctx, 0, R.top, W, PX * 3, '#2a1f29');
+  // 护墙板
+  const wy = R.floorY - 54;
+  rect(ctx, 0, wy, W, 54, '#33262f');
+  rect(ctx, 0, wy, W, PX * 2, '#4c3842');
+  for (let x = 12; x < W; x += 48) {
+    rect(ctx, x, wy + 12, 36, 30, '#2e222b');
+    rect(ctx, x, wy + 12, 36, PX, '#281d25');
+  }
+
+  // 窗
+  const w = R.win;
+  const sk = sky(hour);
+  rect(ctx, w.x - 9, w.y - 9, w.w + 18, w.h + 18, PAL.out);
+  rect(ctx, w.x - 6, w.y - 6, w.w + 12, w.h + 12, PAL.wood);
+  rect(ctx, w.x - 6, w.y + w.h, w.w + 12, 6, PAL.woodS);
+  const b1 = snap(w.h * 0.45);
+  const b2 = snap(w.h * 0.75);
+  rect(ctx, w.x, w.y, w.w, b1, sk[0]);
+  rect(ctx, w.x, w.y + b1, w.w, b2 - b1, sk[1]);
+  rect(ctx, w.x, w.y + b2, w.w, w.h - b2, sk[2]);
+  if (sk[3] === 'night') {
+    // 星星一闪一闪
+    const stars = [[8, 10], [30, 22], [52, 8], [70, 30], [84, 14], [20, 40], [62, 46]];
+    stars.forEach((s, i) => {
+      if (Math.sin(t * 1.7 + i * 2.1) > -0.3 && s[1] < w.h - 30) rect(ctx, w.x + s[0], w.y + s[1], PX, PX, '#f4ecd0');
+    });
+    // 月亮
+    rect(ctx, w.x + 66, w.y + 9, 12, 12, '#f2e6c0');
+    rect(ctx, w.x + 72, w.y + 9, 6, 6, sk[0]);
+  } else if (sk[3] === 'day') {
+    rect(ctx, w.x + 12 + ((t * 2) % 60), w.y + 15, 24, 6, '#eef4f2');
+    rect(ctx, w.x + 18 + ((t * 2) % 60), w.y + 12, 12, 3, '#eef4f2');
+  }
+  // 远处楼
+  const bld = [[0, 36, 18], [18, 52, 15], [33, 30, 21], [54, 46, 15], [69, 26, 24]];
+  bld.forEach((b, i) => {
+    const bh = Math.min(b[1], w.h - 6);
+    rect(ctx, w.x + b[0], w.y + w.h - bh, b[2], bh, sk[3] === 'day' ? '#6c8a9a' : '#18152a');
+    if (sk[3] !== 'day') {
+      for (let yy = w.y + w.h - bh + 6; yy < w.y + w.h - 3; yy += 9)
+        for (let xx = w.x + b[0] + 3; xx < w.x + b[0] + b[2] - 3; xx += 6) {
+          const on = Math.sin(xx * 12.9 + yy * 7.3 + Math.floor(t / 4 + i) * 1.3) > 0.2;
+          if (on) rect(ctx, xx, yy, PX, PX, '#e8b65a');
+        }
+    }
+  });
+  // 窗框十字
+  rect(ctx, w.x + w.w / 2 - 3, w.y, 6, w.h, PAL.wood);
+  rect(ctx, w.x, w.y + snap(w.h / 2) - 3, w.w, 6, PAL.wood);
+  // 窗帘
+  for (const side of [-1, 1]) {
+    const cx = side < 0 ? w.x - 21 : w.x + w.w + 3;
+    rect(ctx, cx - 3, w.y - 12, 24, w.h + 30, PAL.out);
+    rect(ctx, cx, w.y - 9, 18, w.h + 24, '#4f7a6e');
+    rect(ctx, cx + (side < 0 ? 12 : 0), w.y - 9, 6, w.h + 24, '#3c6056');
+    rect(ctx, cx + 6, w.y - 9, PX, w.h + 24, '#5f8c80');
+  }
+  rect(ctx, w.x - 30, w.y - 15, w.w + 60, 6, PAL.out);
+  rect(ctx, w.x - 27, w.y - 14, w.w + 54, 3, PAL.woodL);
+
+  // 门
+  const d = R.door;
+  const knock = o.doorShake ? Math.round(Math.sin(t * 60) * 2) : 0;
+  rect(ctx, d.x - 6, d.y - 6, d.w + 12, d.h + 6, PAL.out);
+  rect(ctx, d.x - 3, d.y - 3, d.w + 6, d.h + 3, '#5a3a2c');
+  rect(ctx, d.x + knock, d.y, d.w, d.h, PAL.wood);
+  rect(ctx, d.x + d.w - 9 + knock, d.y, 9, d.h, PAL.woodS);
+  rect(ctx, d.x + 6 + knock, d.y + 9, d.w - 18, 39, PAL.woodL);
+  rect(ctx, d.x + 6 + knock, d.y + 57, d.w - 18, 45, PAL.woodL);
+  rect(ctx, d.x + 9 + knock, d.y + 12, d.w - 24, 33, PAL.wood);
+  rect(ctx, d.x + 9 + knock, d.y + 60, d.w - 24, 39, PAL.wood);
+  rect(ctx, d.x + d.w - 15 + knock, d.y + 54, 6, 6, PAL.glow);
+  // 门口挂的小钥匙牌：三个颜色 = 三个人
+  ['#7f9a5a', '#5b7fb0', '#c8664a'].forEach((c, i) => rect(ctx, d.x + 9 + i * 9 + knock, d.y - 18, 6, 9, c));
+
+  // 地板
+  rect(ctx, 0, R.floorY, W, R.bottom - R.floorY, '#5a4033');
+  rect(ctx, 0, R.floorY, W, PX * 2, '#3a2a25');
+  rect(ctx, 0, R.floorY + PX * 2, W, PX * 3, '#4b352b');
+  let row = 0;
+  for (let y = R.floorY + 18; y < R.bottom; y += 18, row++) {
+    rect(ctx, 0, y, W, PX, '#4b352b');
+    for (let x = (row % 2) * 45 + 20; x < W; x += 90) rect(ctx, x, y - 15, PX, 15, '#4b352b');
+  }
+  // 中间的地毯
+  const p = R.pet;
+  ellipse(ctx, p.x, p.y - 6, 96, 26, PAL.out);
+  ellipse(ctx, p.x, p.y - 6, 93, 23, '#7a3e36');
+  ellipse(ctx, p.x, p.y - 6, 84, 19, '#a3523f');
+  ellipse(ctx, p.x, p.y - 6, 72, 14, '#7a3e36');
+  for (let i = -3; i <= 3; i++) rect(ctx, p.x + i * 21 - 3, p.y - 7, 6, 3, '#d9a441');
+
+  // 夜里变暗（灯光下面再提亮）
+  ctx.fillStyle = 'rgba(12,8,22,' + (dark * 0.5).toFixed(3) + ')';
+  ctx.fillRect(0, R.top, W, R.bottom - R.top);
+
+  // 灯光：一圈圈的硬边光（不是渐变，跟赛璐璐一个路子）
+  const L = R.lamp;
+  const bands = [[220, 0.05], [165, 0.06], [115, 0.07], [70, 0.09]];
+  const lightK = (0.5 + dark * 0.7) * fl;
+  for (const bd of bands) {
+    ctx.fillStyle = 'rgba(255,205,130,' + (bd[1] * lightK).toFixed(3) + ')';
+    ctx.beginPath();
+    ctx.ellipse(L.x, L.y + 70, bd[0], bd[0] * 0.95, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  // 地上的光斑
+  ctx.fillStyle = 'rgba(255,214,150,' + (0.09 * lightK).toFixed(3) + ')';
+  ctx.beginPath();
+  ctx.ellipse(p.x, p.y - 6, 118, 34, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // 吊灯
+  rect(ctx, L.x - 1, R.top, PX, L.y - R.top - 12, '#1f1820');
+  const sw = Math.round(Math.sin(t * 0.8) * 1);
+  ctx.save();
+  ctx.translate(sw, 0);
+  rect(ctx, L.x - 9, L.y - 15, 18, 6, PAL.out);
+  // 灯罩（梯形）
+  for (let j = 0; j < 7; j++) {
+    const hw = 9 + j * 3;
+    rect(ctx, L.x - hw - 3, L.y - 12 + j * 3, hw * 2 + 6, 3, PAL.out);
+    rect(ctx, L.x - hw, L.y - 12 + j * 3, hw * 2, 3, j > 4 ? PAL.mustardS : PAL.mustard);
+    rect(ctx, L.x + hw - 6, L.y - 12 + j * 3, 6, 3, PAL.mustardS);
+  }
+  rect(ctx, L.x - 30, L.y + 9, 60, 3, PAL.out);
+  // 灯泡
+  const bulbA = Math.min(1, 0.75 + (fl - 1) * 3);
+  ctx.globalAlpha = Math.max(0.4, bulbA);
+  rect(ctx, L.x - 9, L.y + 9, 18, 9, '#fff2c0');
+  rect(ctx, L.x - 6, L.y + 18, 12, 3, PAL.glow);
+  ctx.globalAlpha = 1;
+  ctx.restore();
+}
+
+function ellipse(ctx, x, y, rx, ry, col) {
+  // 用横条拼的像素椭圆
+  ctx.fillStyle = col;
+  for (let yy = -ry; yy < ry; yy += PX) {
+    const k = 1 - ((yy + PX / 2) / ry) ** 2;
+    if (k <= 0) continue;
+    const hw = snap(rx * Math.sqrt(k));
+    ctx.fillRect(snap(x - hw), snap(y + yy), hw * 2, PX + 0.3);
+  }
+}
+
+// 一个角落：地垫 + 家具
+function drawCorner(ctx, R, id, kind, frame, o) {
+  const c = R.corners[id];
+  if (id !== 'me') {
+    ellipse(ctx, c.x, c.y, 51, 13, PAL.out);
+    ellipse(ctx, c.x, c.y, 48, 11, c.mat);
+  } else {
+    ellipse(ctx, c.x, c.y, 45, 9, PAL.out);
+    ellipse(ctx, c.x, c.y, 42, 7, c.mat);
+  }
+  if (kind) {
+    const sp = pix.furnitureSprite(kind, frame);
+    pix.blitBottom(ctx, sp, c.x + (id === 'me' ? 0 : id === 'c' ? -6 : 6), c.y + 3, PX);
+  } else if (o && o.empty) {
+    // 空角落：虚线框 + 加号，一呼一吸
+    const a = 0.45 + Math.sin(o.t * 3) * 0.25;
+    ctx.globalAlpha = a;
+    ctx.fillStyle = PAL.cream2;
+    for (let i = -30; i < 30; i += 9) {
+      ctx.fillRect(c.x + i, c.y - 54, 5, 3);
+      ctx.fillRect(c.x + i, c.y - 3, 5, 3);
+    }
+    for (let j = -54; j < 0; j += 9) {
+      ctx.fillRect(c.x - 33, c.y + j, 3, 5);
+      ctx.fillRect(c.x + 30, c.y + j, 3, 5);
+    }
+    ctx.fillRect(c.x - 9, c.y - 30, 18, 4);
+    ctx.fillRect(c.x - 2, c.y - 37, 4, 18);
+    ctx.globalAlpha = 1;
+  }
+}
+
+module.exports = { PX, snap, layout, drawRoom, drawCorner, ellipse, darkness, sky };
+
+});
+__def("js/sfx.js", function (module, exports, require) {
+// 音效配方：每种操作一个声音，事越大声音越大、越长。全部用 platform.tone 现场合成。
+const platform = require('./platform.js');
+const T = platform.tone;
+
+const N = { C4: 262, D4: 294, E4: 330, F4: 349, G4: 392, A4: 440, B4: 494, C5: 523, D5: 587, E5: 659, G5: 784, A5: 880, C6: 1047 };
+
+const S = {
+  tap() { T({ freq: 880, to: 660, dur: 0.05, type: 'square', vol: 0.08 }); },
+  press() { T({ freq: 520, dur: 0.04, type: 'triangle', vol: 0.08 }); },
+  no() { T({ freq: 180, to: 140, dur: 0.16, type: 'square', vol: 0.1 }); T({ freq: 150, dur: 0.12, type: 'square', vol: 0.08, delay: 0.1 }); },
+  meow() { T({ freq: 700, to: 980, dur: 0.12, type: 'triangle', vol: 0.14 }); T({ freq: 980, to: 620, dur: 0.18, type: 'triangle', vol: 0.12, delay: 0.1 }); },
+  // 倒猫粮：一串高音叮叮
+  pour() { for (let i = 0; i < 7; i++) T({ freq: 1400 + Math.random() * 900, dur: 0.04, type: 'square', vol: 0.05, delay: i * 0.06 }); },
+  nom() { T({ freq: 240, to: 160, dur: 0.08, type: 'square', vol: 0.09 }); },
+  // 呼噜：低频噪声一下一下
+  purr() { T({ noise: true, freq: 220, to: 160, dur: 0.22, vol: 0.12 }); },
+  rub() { T({ noise: true, freq: 1800, to: 900, dur: 0.06, vol: 0.04, filter: 'bandpass' }); },
+  bubble() { T({ freq: 500 + Math.random() * 500, to: 1300, dur: 0.06, type: 'sine', vol: 0.09 }); },
+  whoosh() { T({ noise: true, freq: 2400, to: 300, dur: 0.35, vol: 0.12 }); },
+  lullaby() { [N.E5, N.C5, N.G4].forEach((f, i) => T({ freq: f, dur: 0.32, type: 'triangle', vol: 0.12, delay: 0.25 + i * 0.28 })); },
+  done() { T({ freq: N.C5, dur: 0.1, type: 'square', vol: 0.09 }); T({ freq: N.G5, dur: 0.16, type: 'square', vol: 0.09, delay: 0.08 }); },
+  heart() { [N.C5, N.E5, N.G5, N.C6].forEach((f, i) => T({ freq: f, dur: 0.12, type: 'square', vol: 0.09, delay: i * 0.06 })); },
+  knock() { T({ freq: 120, to: 70, dur: 0.1, type: 'sine', vol: 0.3 }); T({ freq: 120, to: 70, dur: 0.1, type: 'sine', vol: 0.3, delay: 0.18 }); T({ noise: true, freq: 500, dur: 0.05, vol: 0.08 }); },
+  bell() { T({ freq: N.E5, dur: 0.4, type: 'triangle', vol: 0.15 }); T({ freq: N.C5, dur: 0.6, type: 'triangle', vol: 0.15, delay: 0.25 }); },
+  absent() { T({ freq: N.A4, to: N.F4, dur: 0.3, type: 'triangle', vol: 0.12 }); T({ freq: N.E4, dur: 0.4, type: 'triangle', vol: 0.1, delay: 0.25 }); },
+  sick() { [N.E4, N.D4, N.C4].forEach((f, i) => T({ freq: f, dur: 0.3, type: 'triangle', vol: 0.14, delay: i * 0.22 })); },
+  sulk() { T({ freq: 320, to: 200, dur: 0.25, type: 'square', vol: 0.08 }); },
+  // 大事：替朋友 / 治好 / 重逢 —— 和弦 + 琶音，更响更长
+  cover() {
+    [N.C5, N.E5, N.G5].forEach((f) => T({ freq: f, dur: 0.7, type: 'triangle', vol: 0.12 }));
+    [N.G5, N.C6].forEach((f, i) => T({ freq: f, dur: 0.25, type: 'square', vol: 0.07, delay: 0.3 + i * 0.12 }));
+  },
+  cured() {
+    [N.C5, N.E5, N.G5, N.C6, N.G5, N.C6].forEach((f, i) => T({ freq: f, dur: 0.18, type: 'square', vol: 0.11, delay: i * 0.09 }));
+    T({ freq: N.C4, dur: 0.9, type: 'triangle', vol: 0.16, delay: 0.1 });
+  },
+  reunion() {
+    S.meow();
+    [N.G4, N.C5, N.E5, N.G5].forEach((f, i) => T({ freq: f, dur: 0.3, type: 'triangle', vol: 0.13, delay: 0.25 + i * 0.1 }));
+  },
+  ad() { T({ freq: 660, dur: 0.08, type: 'square', vol: 0.08 }); },
+  ff() { T({ freq: 300, to: 1200, dur: 0.35, type: 'sawtooth', vol: 0.06 }); },
+  place() { T({ freq: 200, to: 120, dur: 0.12, type: 'square', vol: 0.12 }); S.done(); },
+};
+
+module.exports = S;
+
+});
+__def("js/sim.js", function (module, exports, require) {
+// 规则层：宠物需求、你的精力、两个假朋友的作息、后果（闹脾气 / 生病 / 跑去朋友角落 / 想念）。
+// 不碰画面、不碰平台：node 里也能直接跑（test/balance.js 用它算几百天）。
+const C = require('./config.js');
+
+const NEEDS = ['food', 'rest', 'love', 'clean'];
+const DAY = 1440;
+const ACT_NEED = { feed: 'food', pat: 'love', tuck: 'rest', clean: 'clean' };
+const VERB = { feed: '喂了它', pat: '摸了摸它的头', tuck: '给它盖了被子', clean: '给它洗干净了' };
+const SHORT = { feed: '喂', pat: '摸', tuck: '盖被', clean: '洗' };
+
+function hm(s) {
+  const p = s.split(':');
+  return +p[0] * 60 + +p[1];
+}
+
+function friendCfg(id) {
+  return C.friends.find((f) => f.id === id);
+}
+
+function name(who) {
+  if (who === 'me') return '你';
+  const f = friendCfg(who);
+  return f ? f.name : who;
+}
+
+// 存在存档里的随机数（mulberry32），每次取一个都会变
+function rand(S) {
+  let a = (S.rs = (S.rs + 0x6d2b79f5) | 0);
+  let t = Math.imul(a ^ (a >>> 15), 1 | a);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+}
+
+function newState(seed) {
+  const t = (C.time.startDay - 1) * DAY + C.time.startHour * 60;
+  const S = {
+    v: 1,
+    t,
+    rs: seed | 0,
+    needs: Object.assign({}, C.needs.start),
+    asleep: false,
+    floorSleep: false,
+    blanket: null, // 谁盖的被子
+    sleepT: 0,
+    sick: false,
+    neglect: 0,
+    recover: 0,
+    sulk: false,
+    corner: null, // 它跑去谁的角落了
+    energy: C.energy.start,
+    energyAcc: 0,
+    last: { me: t, c: t - 60, s: t - 120 }, // 每个人上次来照顾的时间
+    lastBy: { feed: null, pat: null, tuck: null, clean: null }, // 每样东西最后是谁做的（房间里的痕迹）
+    friends: {},
+    cover: null, // { who, acts:[], until, reason }
+    hearts: { c: 0, s: 0 }, // 朋友留在她角落的爱心
+    sentHeart: { c: -1, s: -1 }, // 你哪天给她留过爱心
+    owed: { c: 0, s: 0 }, // 你替她做过几次（她下次来会回谢）
+    missing: {}, // 它正在想谁
+    furniture: { me: null },
+    unlocked: {},
+    log: [],
+    events: [], // 给画面层的一次性事件（敲门、朋友来了……）
+    stats: { min: 0, sickMin: 0, sulkMin: 0, cornerMin: 0, lowMin: 0, needSum: 0, covers: 0, adCovers: 0, missed: 0, doctor: 0, sickTimes: 0, myActs: 0 },
+  };
+  for (const f of C.friends) S.friends[f.id] = { tripUntil: -1, visitUntil: -1, lastShift: {} };
+  return S;
+}
+
+function log(S, who, text, kind) {
+  // 同一句话一小时内不重复记
+  for (let i = S.log.length - 1; i >= 0 && S.t - S.log[i].t < 60; i--) {
+    if (S.log[i].who === who && S.log[i].text === text) return;
+  }
+  S.log.push({ t: Math.round(S.t), who, text, kind: kind || '' });
+  if (S.log.length > 80) S.log.splice(0, S.log.length - 80);
+}
+
+function event(S, e) {
+  S.events.push(e);
+  if (S.events.length > 30) S.events.shift();
+}
+
+function clamp(v) {
+  return v < 0 ? 0 : v > 100 ? 100 : v;
+}
+
+// —— 能不能做这件事（不能的话返回理由，给画面层显示）——
+function check(S, act, who) {
+  const n = S.needs;
+  if (who === 'me' && S.energy < 1) return 'tired';
+  if (act === 'feed') {
+    if (S.asleep) return 'asleep';
+    if (n.food >= C.acts.feed.fullAt) return 'full';
+  } else if (act === 'pat') {
+    if (n.love >= C.acts.pat.fullAt) return 'full';
+  } else if (act === 'tuck') {
+    if (S.asleep && S.blanket) return 'asleep';
+    if (!S.asleep && n.rest >= C.acts.tuck.sleepyAt) return 'notSleepy';
+  } else if (act === 'clean') {
+    if (S.asleep) return 'asleep';
+    if (n.clean >= C.acts.clean.fullAt) return 'full';
+  }
+  return null;
+}
+
+// 做一件照顾的事。free = 看广告代做（不花精力）。返回 null 或不能做的理由。
+function act(S, kind, who, opts) {
+  opts = opts || {};
+  const why = check(S, kind, opts.free ? 'ad' : who);
+  if (why) return why;
+  const n = S.needs;
+  const A = C.acts;
+  if (kind === 'feed') {
+    n.food = clamp(n.food + (S.sick ? A.feed.sickGain : A.feed.gain));
+    n.clean = clamp(n.clean - A.feed.cleanCost);
+  } else if (kind === 'pat') {
+    n.love = clamp(n.love + (S.asleep ? A.pat.asleepGain : A.pat.gain));
+  } else if (kind === 'tuck') {
+    S.asleep = true;
+    S.floorSleep = false;
+    S.blanket = who;
+    S.sleepT = 0;
+  } else if (kind === 'clean') {
+    n.clean = clamp(n.clean + A.clean.gain);
+  }
+  if (kind !== 'pat') n.love = clamp(n.love + A.companyLove);
+  if (who === 'me' && !opts.free) S.energy -= 1;
+  if (who === 'me') S.stats.myActs++;
+
+  // 替缺席的朋友做了她该做的事
+  let covered = null;
+  if (who === 'me' && S.cover && S.t <= S.cover.until && S.cover.acts.indexOf(kind) >= 0) {
+    covered = S.cover.who;
+    S.cover.acts.splice(S.cover.acts.indexOf(kind), 1);
+    S.owed[covered]++;
+    S.stats.covers++;
+    if (opts.free) S.stats.adCovers++;
+    if (!S.cover.acts.length) S.cover = null;
+  }
+  S.last[who] = S.t;
+  S.lastBy[kind] = { who, t: Math.round(S.t) };
+  if (S.missing[who]) delete S.missing[who];
+  if (covered) log(S, who, '替' + name(covered) + VERB[kind], 'cover');
+  else log(S, who, VERB[kind], kind);
+  if (who === 'me' && S.corner && n.love >= C.corner.backAt) backFromCorner(S);
+  return null;
+}
+
+function backFromCorner(S) {
+  S.corner = null;
+  log(S, 'pet', '回到了屋子中间', 'back');
+  event(S, { type: 'back' });
+}
+
+function doctor(S) {
+  if (!S.sick) return false;
+  S.sick = false;
+  S.neglect = 0;
+  S.recover = 0;
+  for (const k of NEEDS) S.needs[k] = Math.max(S.needs[k], 45);
+  S.stats.doctor++;
+  log(S, 'me', '请医生来看了它，它好了', 'doctor');
+  return true;
+}
+
+// 你给朋友留一个预设动作（敲门 / 留爱心）
+function send(S, to, what) {
+  const day = Math.floor(S.t / DAY);
+  if (what === 'heart') {
+    if (S.sentHeart[to] === day) return 'already';
+    S.sentHeart[to] = day;
+    log(S, 'me', '给' + name(to) + '留了一颗爱心', 'heart');
+  } else {
+    log(S, 'me', '敲了敲' + name(to) + '的门', 'knock');
+  }
+  return null;
+}
+
+function collectHeart(S, from) {
+  if (!S.hearts[from]) return false;
+  S.hearts[from] = 0;
+  S.energy = Math.min(C.energy.max + 1, S.energy + C.heartEnergy); // 爱心可以多出一格
+  return true;
+}
+
+// —— 朋友到点来上班 ——
+function friendShift(S, f, shift) {
+  const fs = S.friends[f.id];
+  const day = Math.floor(S.t / DAY);
+  if (fs.lastShift[shift.at] === day) return;
+  fs.lastShift[shift.at] = day;
+
+  let reason = null;
+  if (S.t < fs.tripUntil) reason = '出远门了';
+  else {
+    let p = f.skip;
+    if (S.sentHeart[f.id] >= day - 1) p *= C.heartSkipMul;
+    if (rand(S) < p) reason = f.reasons[Math.floor(rand(S) * f.reasons.length)];
+  }
+  if (reason) {
+    S.stats.missed++;
+    // 只为真正需要的事求你替：已经满的就不算
+    const need = shift.acts.filter((a) => a === 'pat' || check(S, a, f.id) !== 'full');
+    log(S, f.id, '没来（' + reason + '）', 'miss');
+    if (need.length) {
+      S.cover = { who: f.id, acts: need.slice(), until: S.t + C.cover.windowMin, reason };
+      event(S, { type: 'absent', who: f.id });
+    }
+    return;
+  }
+  // 来了
+  if (S.cover && S.cover.who === f.id) S.cover = null;
+  fs.visitUntil = S.t + C.friendVisitMin;
+  event(S, { type: 'arrive', who: f.id });
+  for (const a of shift.acts) {
+    let r = act(S, a, f.id);
+    if (r) act(S, 'pat', f.id); // 要做的事已经不用做了，就摸摸它
+  }
+  if (!S.last[f.id] || S.last[f.id] < S.t) S.last[f.id] = S.t;
+  if (S.owed[f.id] > 0) {
+    S.owed[f.id] = 0;
+    S.hearts[f.id] = 1;
+    log(S, f.id, '回了你一个「谢谢」，留下一颗爱心', 'thanks');
+  } else if (rand(S) < f.heartChance) {
+    S.hearts[f.id] = 1;
+    log(S, f.id, '留了一颗爱心', 'heart');
+  }
+  if (rand(S) < f.knockChance) {
+    log(S, f.id, '敲了敲门', 'knock');
+    event(S, { type: 'knock', who: f.id });
+  }
+}
+
+// 往前走 dt 游戏分钟（内部按 1 分钟一步）
+function advance(S, dt) {
+  S._acc = (S._acc || 0) + dt;
+  while (S._acc >= 1) {
+    S._acc -= 1;
+    step(S);
+  }
+}
+
+function step(S) {
+  const prevDay = Math.floor(S.t / DAY);
+  const prevMin = S.t % DAY;
+  S.t += 1;
+  const day = Math.floor(S.t / DAY);
+  const min = S.t % DAY;
+  const n = S.needs;
+  const N = C.needs;
+  const h = 1 / 60;
+
+  // 出远门：每天早上决定一次
+  if (day !== prevDay) {
+    for (const f of C.friends) {
+      const fs = S.friends[f.id];
+      if (S.t >= fs.tripUntil && f.tripPerDay && rand(S) < f.tripPerDay) {
+        const d = f.tripDays[0] + Math.floor(rand(S) * (f.tripDays[1] - f.tripDays[0] + 1));
+        fs.tripUntil = S.t + d * DAY;
+        log(S, f.id, '出远门了（' + d + '天）', 'trip');
+      }
+    }
+  }
+
+  // 需求往下掉
+  const sickMul = S.sick ? N.sickMul : 1;
+  for (const k of NEEDS) {
+    if (k === 'rest') continue;
+    const m = S.asleep ? N.sleepMul[k] : 1;
+    n[k] = clamp(n[k] - N.decayPerHour[k] * h * m * sickMul);
+  }
+  if (S.asleep) {
+    const r = C.sleep.restorePerHour * (S.floorSleep ? C.sleep.floorMul : 1);
+    n.rest = clamp(n.rest + r * h);
+    S.sleepT += 1;
+    if (S.floorSleep && !S.sick && rand(S) < C.sleep.floorColdPerHour * h) {
+      getSick(S, '睡地板着凉了');
+    }
+    let wake = null;
+    if (n.rest >= 100 || S.sleepT >= C.acts.tuck.maxSleepMin) wake = '睡醒了';
+    else if (n.food <= C.sleep.wakeHungryAt) wake = '饿醒了';
+    if (wake) {
+      S.asleep = false;
+      S.floorSleep = false;
+      S.blanket = null;
+      log(S, 'pet', wake, 'wake');
+      event(S, { type: 'wake' });
+    }
+  } else {
+    n.rest = clamp(n.rest - N.decayPerHour.rest * h * sickMul);
+    if (n.rest <= C.sleep.collapseAt && n.food <= C.sleep.wakeHungryAt + 4) {
+      // 又困又饿：饿得睡不着（只记一次）
+      if (!S.hungryAwake) {
+        S.hungryAwake = true;
+        log(S, 'pet', '又困又饿，睡不着', 'sulk');
+      }
+    } else if (n.rest <= C.sleep.collapseAt) {
+      S.hungryAwake = false;
+      S.asleep = true;
+      S.floorSleep = true;
+      S.blanket = null;
+      S.sleepT = 0;
+      log(S, 'pet', '困得直接睡在了地板上', 'floor');
+    }
+  }
+
+  // 精力
+  if (S.energy < C.energy.max) {
+    S.energyAcc += 1;
+    if (S.energyAcc >= C.energy.regenMin) {
+      S.energyAcc = 0;
+      S.energy += 1;
+    }
+  } else S.energyAcc = 0;
+
+  // 闹脾气
+  const lowest = Math.min(n.food, n.rest, n.love, n.clean);
+  if (!S.sulk && lowest < C.sulk.below) {
+    S.sulk = true;
+    const k = NEEDS.reduce((a, b) => (n[a] <= n[b] ? a : b));
+    log(S, 'pet', '闹脾气了（' + { food: '太饿', rest: '太困', love: '没人理它', clean: '身上脏' }[k] + '）', 'sulk');
+  } else if (S.sulk && lowest >= C.sulk.recoverAt) {
+    S.sulk = false;
+    log(S, 'pet', '不生气了', 'unsulk');
+  }
+
+  // 生病
+  if (!S.sick) {
+    if (lowest <= C.sick.neglectAt) S.neglect += 1;
+    else S.neglect = Math.max(0, S.neglect - 0.5);
+    if (S.neglect >= C.sick.neglectMin) getSick(S, '被冷落太久');
+  } else {
+    if (lowest >= C.sick.recoverAllAbove) S.recover += 1;
+    else S.recover = 0;
+    if (S.recover >= C.sick.recoverMin) {
+      S.sick = false;
+      S.recover = 0;
+      S.neglect = 0;
+      log(S, 'pet', '慢慢自己好了', 'cured');
+    }
+  }
+
+  // 跑去朋友角落
+  if (!S.corner && n.love < C.corner.loveBelow) {
+    let best = null;
+    for (const f of C.friends) if (!best || S.last[f.id] > S.last[best]) best = f.id;
+    if (best && S.last[best] > S.last.me) {
+      S.corner = best;
+      log(S, 'pet', '跑去' + name(best) + '的角落睡了', 'corner');
+      event(S, { type: 'corner', who: best });
+    }
+  } else if (S.corner && n.love >= C.corner.backAt) backFromCorner(S);
+
+  // 想念：谁很久没来
+  for (const who of ['me', 'c', 's']) {
+    const gone = S.t - S.last[who] >= C.miss.afterMin;
+    if (gone && !S.missing[who]) {
+      S.missing[who] = S.t;
+      if (who !== 'me') log(S, 'pet', '一直望着' + name(who) + '的角落', 'missing');
+    } else if (!gone && S.missing[who]) delete S.missing[who];
+  }
+
+  // 朋友到点
+  for (const f of C.friends) {
+    for (const sh of f.shifts) {
+      const at = hm(sh.at);
+      if (prevMin < at && min >= at) friendShift(S, f, sh);
+    }
+  }
+  if (S.cover && S.t > S.cover.until) {
+    log(S, 'pet', '没等到' + name(S.cover.who), 'expire');
+    S.cover = null;
+  }
+
+  // 统计（机器人比较懒人和勤快人用）
+  const st = S.stats;
+  st.min++;
+  st.needSum += (n.food + n.rest + n.love + n.clean) / 4;
+  if (S.sick) st.sickMin++;
+  if (S.sulk) st.sulkMin++;
+  if (S.corner) st.cornerMin++;
+  if (lowest < N.lowAt) st.lowMin++;
+}
+
+function getSick(S, why) {
+  S.sick = true;
+  S.recover = 0;
+  S.stats.sickTimes++;
+  log(S, 'pet', '生病了（' + why + '）', 'sick');
+  event(S, { type: 'sick' });
+}
+
+// 它现在最想要什么（分享卡、提示用）
+function worst(S) {
+  if (S.sick) return 'sick';
+  const n = S.needs;
+  const k = NEEDS.reduce((a, b) => (n[a] <= n[b] ? a : b));
+  return n[k] < 45 ? k : 'ok';
+}
+
+// 「小C 昨晚 23:10 给它盖了被子」
+function when(t, now) {
+  const d = Math.floor(t / DAY);
+  const nd = Math.floor(now / DAY);
+  const m = ((t % DAY) + DAY) % DAY;
+  const hh = Math.floor(m / 60);
+  const mm = m % 60;
+  const clock = hh + ':' + (mm < 10 ? '0' : '') + mm;
+  const part = hh < 5 ? '凌晨' : hh < 9 ? '早上' : hh < 12 ? '上午' : hh < 14 ? '中午' : hh < 18 ? '下午' : hh < 19 ? '傍晚' : '晚上';
+  let day;
+  if (d === nd) day = part === '晚上' ? '今晚' : '今天' + part;
+  else if (d === nd - 1) day = part === '晚上' ? '昨晚' : '昨天' + part;
+  else day = nd - d + '天前' + part;
+  return day + ' ' + clock;
+}
+
+function line(e, now) {
+  const who = e.who === 'pet' ? C.petName : name(e.who);
+  return who + ' ' + when(e.t, now) + ' ' + e.text;
+}
+
+module.exports = { NEEDS, DAY, ACT_NEED, VERB, SHORT, newState, advance, act, check, doctor, send, collectHeart, worst, when, line, name, friendCfg, rand };
+
+});
+__require('')('./game.js');
+</script>
+</body>
+</html>
